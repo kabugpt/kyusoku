@@ -338,7 +338,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.4 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.4.1 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -1538,6 +1538,7 @@ function scanMotion(v,fps,progress,frameTimes){
           prev=d;
           if(i%10===0){
             progress(Math.round(i/n*100));
+            i++;
             setTimeout(stepOne,0);
           }else{
             i++; stepOne();
