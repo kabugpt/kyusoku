@@ -4,11 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0b1020">
-<title>キュウソク | 動画で球速測定</title>
+<title>キュウソク | 投げるだけで球速測定</title>
 <style>
 :root{
   --bg:#0b1020; --card:#151d33; --line:#26304f; --text:#e8ecf8; --muted:#9aa7c7;
-  --accent:#ff5252; --accent2:#4fc3f7; --gold:#ffd54f;
+  --accent:#ff5252; --accent2:#4fc3f7; --gold:#ffd54f; --orange:#ff8a1e;
+  --mono:ui-monospace,"SF Mono","Roboto Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace;
 }
 *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
 html,body{margin:0;padding:0;}
@@ -22,13 +23,15 @@ header{padding:10px 4px 2px;}
 header h1{margin:0;font-size:26px;letter-spacing:1px;}
 header h1 .dot{color:var(--accent);}
 header .sub{margin:4px 0 0;font-size:12px;color:var(--muted);}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-top:12px;}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-top:12px;scroll-margin-top:8px;}
+#quickView{display:flex;flex-direction:column;}
+#qResultCard{order:-1;}
 .card h2{margin:0 0 10px;font-size:15px;color:var(--gold);}
 .muted{color:var(--muted);}
 .small{font-size:12px;}
 .center{text-align:center;}
 .err{color:#ff8a80;font-size:13px;}
-.hl{color:var(--gold);}
+.hl{color:var(--orange);}
 
 .btn{
   display:inline-block;border:1px solid var(--line);background:#1d2745;color:var(--text);
@@ -43,6 +46,29 @@ header .sub{margin:4px 0 0;font-size:12px;color:var(--muted);}
 
 video{width:100%;background:#000;border-radius:10px;display:block;}
 #noVideo{border:1px dashed var(--line);border-radius:10px;padding:26px 10px;text-align:center;}
+
+/* クイック計測ステータス（大きく表示） */
+.qstatus{
+  font-size:20px;font-weight:900;text-align:center;padding:12px 10px;border-radius:12px;
+  margin-bottom:10px;border:1px solid var(--line);letter-spacing:1px;
+}
+.qstatus .qsub{display:block;font-size:12px;font-weight:400;margin-top:4px;letter-spacing:0;}
+.st-idle{background:#12233a;color:#b3e5fc;}
+.st-boot{background:#12233a;color:#b3e5fc;}
+.st-rec{background:#3a1620;color:#ff8a80;border-color:var(--accent);animation:pulse 1s infinite;}
+.st-ana{background:#3a3212;color:var(--gold);}
+.st-done{background:#12351f;color:#a5d6a7;border-color:#2e7d32;}
+.st-err{background:#3a1620;color:#ff8a80;border-color:var(--accent);}
+@keyframes pulse{50%{opacity:.55;}}
+
+.qrow{display:flex;gap:8px;margin-top:8px;}
+.qrow .btn{flex:1;}
+
+.nudge{margin-top:10px;border-top:1px solid var(--line);padding-top:10px;}
+.nudge-row{display:flex;align-items:center;gap:6px;margin-bottom:8px;}
+.nudge-label{font-size:13px;color:var(--muted);width:56px;flex-shrink:0;}
+.nudge-row .small{flex:1;text-align:center;color:var(--text);}
+.est-note{font-size:12px;color:var(--gold);background:#2a2410;border:1px solid #4a3f14;border-radius:8px;padding:8px 10px;margin-top:10px;line-height:1.6;}
 
 input[type=range]{width:100%;accent-color:var(--accent);}
 input[type=text],input[type=number],input[type=date],select{
@@ -67,20 +93,38 @@ input[type=text],input[type=number],input[type=date],select{
 .mark-row .btn{width:100%;}
 .mark-row .small{margin-top:4px;min-height:16px;}
 
-.result{margin-top:12px;border-top:1px solid var(--line);padding-top:10px;}
-.kmh{font-size:44px;font-weight:900;line-height:1.1;color:#fff;}
-.kmh .unit{font-size:18px;font-weight:700;color:var(--gold);margin-left:6px;}
-.result .small{margin-top:2px;}
+.result{margin-top:12px;}
+/* ---- 結果パネル（TrackMan風ダッシュボード）: 主役の特大数値＋副次指標タイル ---- */
+.hero-tile{
+  border:2px solid var(--orange);border-radius:14px;text-align:center;
+  background:radial-gradient(120% 170% at 50% 0%, #241605 0%, #131a30 72%);
+  padding:10px 8px 12px;
+  box-shadow:0 0 22px rgba(255,138,30,.28), inset 0 0 30px rgba(255,138,30,.07);
+}
+.hero-val{
+  font-family:var(--mono);font-variant-numeric:tabular-nums;
+  font-size:clamp(56px,17vw,88px);font-weight:800;line-height:1;
+  color:var(--orange);letter-spacing:-.03em;
+  text-shadow:0 0 26px rgba(255,138,30,.5);
+}
+.hero-unit{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--orange);opacity:.9;margin-top:4px;letter-spacing:.35em;text-indent:.35em;}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px;}
+.tile{background:#111a31;border:1px solid var(--line);border-radius:10px;padding:7px 4px 8px;text-align:center;min-width:0;}
+.t-label{font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.t-val{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:17px;font-weight:700;color:var(--text);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.t-val.t-acc{color:var(--orange);}
+.t-sub{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:10px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 
 .stats{font-size:14px;margin:6px 0 10px;color:var(--muted);}
+.stats b{font-family:var(--mono);font-variant-numeric:tabular-nums;}
 .records{list-style:none;margin:0;padding:0;}
 .rec{
   display:flex;align-items:center;justify-content:space-between;gap:8px;
-  border:1px solid var(--line);border-radius:10px;padding:8px 10px;margin-bottom:8px;background:#101832;
+  border:1px solid var(--line);border-radius:10px;padding:8px 10px;margin-bottom:8px;background:#0f1730;
 }
 .rec-top{display:flex;align-items:baseline;gap:8px;}
 .rec-name{font-weight:700;font-size:14px;}
-.rec-kmh{font-weight:900;color:var(--gold);font-size:16px;}
+.rec-kmh{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:700;color:var(--orange);font-size:16px;}
 .rec-sub{font-size:11px;color:var(--muted);margin-top:2px;}
 .rec-btns{display:flex;flex-direction:column;gap:6px;flex-shrink:0;}
 
@@ -100,128 +144,358 @@ footer{margin-top:20px;}
 <div class="wrap">
   <header>
     <h1>キュウソク<span class="dot">。</span></h1>
-    <p class="sub">スマホの投球動画から球速を測定 — 動画はこの端末の中だけで処理され、どこにも送信されません</p>
+    <p class="sub">投げるだけで球速を自動計測 — 動画はこの端末の中だけで処理され、どこにも送信されません</p>
   </header>
 
-  <section class="card">
-    <h2>1. 動画を読み込む</h2>
-    <div class="seg" id="modeSeg">
-      <button data-mode="file" class="active">ファイルから選ぶ</button>
-      <button data-mode="camera">カメラで撮る</button>
+  <div class="seg" id="viewSeg" style="margin-top:10px">
+    <button data-view="quick" class="active">クイック計測</button>
+    <button data-view="detail">詳しく測る</button>
+  </div>
+
+  <!-- ===== クイック計測（初期画面） ===== -->
+  <section id="quickView">
+    <div class="card">
+      <div id="qStatus" class="qstatus st-boot">カメラを起動しています…</div>
+      <video id="quickVideo" playsinline muted autoplay></video>
+      <canvas id="qMon" width="80" height="45" hidden></canvas>
+      <video id="analyzeVideo" playsinline preload="auto" hidden></video>
+      <p id="qCamMsg" class="err" hidden></p>
+      <div class="qrow">
+        <button class="btn btn-small" id="qRetryCam" hidden>カメラを許可して再試行</button>
+        <button class="btn btn-small" id="qToFile" hidden>ファイルから詳しく測る</button>
+      </div>
+      <p id="qCamInfo" class="muted small"></p>
+      <div class="row-label">投球距離プリセット（前回値を自動で復元）</div>
+      <select id="qDistPreset">
+        <option value="18.44">18.44m（一般・高校・中学）</option>
+        <option value="16.46">16.46m（少年野球）</option>
+        <option value="14.02">14.02m（学童）</option>
+        <option value="custom">カスタム入力</option>
+      </select>
+      <div id="qCustomWrap" hidden>
+        <input type="number" id="qCustomDist" min="1" max="30" step="0.01" placeholder="距離を入力（m）">
+      </div>
+      <div class="row-label">リリース補正（手前で離れる分・前回値を復元） <span id="qCorrVal">1.2m</span></div>
+      <input type="range" id="qCorr" min="0" max="3" step="0.1" value="1.2">
+      <details class="guide">
+        <summary>撮影ガイドを見る</summary>
+        <ul>
+          <li>三塁側（投手の利き腕と逆側）から横に構え、三脚などでスマホを固定する</li>
+          <li>明るい場所で、ボールが見やすい単色の背景（ネット・フェンス等）を選ぶ</li>
+          <li>投げる前に一度体を止めると検知が安定する（大きな動きが続いたら自動で録画開始）</li>
+          <li>録画はボタン不要。動きが収まって約1.5秒後に自動停止し、そのまま解析へ進む</li>
+          <li>ミットにボールが入る音が録れると到達フレームの推定精度が上がる</li>
+          <li>リリースから捕球までボールが画面から切れない構図にする</li>
+          <li>アプリ内撮影は端末・ブラウザ仕様で最大60fps程度。240fps級の精度が要る場合は「詳しく測る」からカメラアプリのスローモーション動画を選ぶ</li>
+        </ul>
+      </details>
     </div>
-    <div id="filePanel" style="margin-top:10px">
-      <label class="btn btn-primary file-btn">動画ファイルを選ぶ
-        <input type="file" id="fileInput" accept="video/*" hidden>
-      </label>
-      <p id="fileName" class="muted small">未選択</p>
-    </div>
-    <div id="camPanel" hidden style="margin-top:10px">
-      <video id="camVideo" playsinline muted autoplay></video>
-      <p id="camStatus" class="muted small">カメラを起動します…</p>
-      <p id="camFps" class="muted small"></p>
+
+    <div class="card" id="qResultCard" hidden>
+      <h2>計測結果（自動推定・自動保存済み）</h2>
+      <div id="qResult" class="result"></div>
+      <div class="est-note">
+        リリース/到達フレームは映像と音声からの自動推定（ヒューリスティクス）です。
+        候補が外れた場合は下の -1F / +1F で微調整してください。球速は即座に再計算され、保存済みの記録も更新されます。
+      </div>
+      <div class="nudge">
+        <div class="nudge-row">
+          <span class="nudge-label">リリース</span>
+          <button class="btn btn-small" id="qRelMinus">-1F</button>
+          <span id="qRelInfo" class="small">-</span>
+          <button class="btn btn-small" id="qRelPlus">+1F</button>
+        </div>
+        <div class="nudge-row">
+          <span class="nudge-label">到達</span>
+          <button class="btn btn-small" id="qArrMinus">-1F</button>
+          <span id="qArrInfo" class="small">-</span>
+          <button class="btn btn-small" id="qArrPlus">+1F</button>
+        </div>
+        <div class="small muted" id="qArrSource"></div>
+      </div>
+      <input type="text" id="qPlayerName" placeholder="選手名（例：山田 太郎・保存時に記録）" maxlength="20" style="margin-top:10px">
+      <button class="btn btn-primary" id="qShareBtn" style="width:100%">共有画像を保存（1タップ）</button>
       <div class="mark-row" style="margin-top:8px">
-        <button class="btn btn-primary" id="recStart">録画開始</button>
-        <button class="btn btn-accent" id="recStop" disabled>録画停止</button>
-      </div>
-      <p id="recInfo" class="muted small"></p>
-    </div>
-    <p id="modeMsg" class="err" hidden></p>
-    <details class="guide">
-      <summary>撮影ガイドを見る</summary>
-      <ul>
-        <li>三塁側（投手の利き腕と逆側）から横に構えて撮影する</li>
-        <li>スローモーション（240fps）で撮ると推定精度が約±1%になる</li>
-        <li>リリースから捕球（ミット到達）までボールが画面から切れない構図にする</li>
-        <li>三脚などでスマホを固定し、明るい場所で撮る</li>
-        <li>ボールが見やすい単色の背景（ネット・フェンス等）がよい</li>
-        <li>アプリ内撮影は端末・ブラウザ仕様で最大60fps程度のため、240fps級の精度が要る場合はカメラアプリのスローモーション撮影＋ファイル選択が推奨</li>
-      </ul>
-    </details>
-  </section>
-
-  <section class="card">
-    <h2>2. コマ送り</h2>
-    <div id="noVideo" class="muted small">動画を読み込むとここに表示されます（タップで再生/一時停止）</div>
-    <video id="video" playsinline preload="metadata" hidden></video>
-    <input type="range" id="seek" min="0" max="0" value="0" step="1" disabled>
-    <div id="frameInfo" class="muted small">フレーム - / -</div>
-    <div class="ctl-row">
-      <button class="btn" id="back10" disabled>-10</button>
-      <button class="btn" id="back1" disabled>-1</button>
-      <button class="btn btn-primary" id="playBtn" disabled>再生</button>
-      <button class="btn" id="fwd1" disabled>+1</button>
-      <button class="btn" id="fwd10" disabled>+10</button>
-    </div>
-    <div class="row-label">動画のfps（撮影時の設定）</div>
-    <div class="seg" id="fpsSeg">
-      <button data-fps="30">30</button>
-      <button data-fps="60" class="active">60</button>
-      <button data-fps="120">120</button>
-      <button data-fps="240">240</button>
-    </div>
-    <div class="row-label">再生速度</div>
-    <div class="seg" id="speedSeg">
-      <button data-rate="1" class="active">1x</button>
-      <button data-rate="0.5">0.5x</button>
-      <button data-rate="0.25">0.25x</button>
-      <button data-rate="0.1">0.1x</button>
-    </div>
-  </section>
-
-  <section class="card">
-    <h2>3. 測定（2フレーム指定）</h2>
-    <div class="mark-row">
-      <div>
-        <button class="btn btn-accent" id="markRelease" disabled>リリース点に設定</button>
-        <div id="releaseInfo" class="muted small">未設定</div>
-      </div>
-      <div>
-        <button class="btn btn-accent2" id="markArrival" disabled>到達点に設定</button>
-        <div id="arrivalInfo" class="muted small">未設定</div>
+        <button class="btn" id="qDetailBtn">詳しく測る（コマ送り調整）</button>
+        <button class="btn btn-accent2" id="qAgainBtn">もう一度測る</button>
       </div>
     </div>
-    <div class="row-label">投球距離プリセット</div>
-    <select id="distPreset">
-      <option value="18.44">18.44m（一般・高校・中学）</option>
-      <option value="16.46">16.46m（少年野球）</option>
-      <option value="14.02">14.02m（学童）</option>
-      <option value="custom">カスタム入力</option>
-    </select>
-    <div id="customWrap" hidden>
-      <input type="number" id="customDist" min="1" max="30" step="0.01" placeholder="距離を入力（m）">
+  </section>
+
+  <!-- ===== 詳しく測る（従来の精密計測フロー） ===== -->
+  <section id="detailView" hidden>
+    <div class="card">
+      <button class="btn btn-small" id="backToQuick">← クイック計測に戻る</button>
+      <p class="muted small" style="margin:8px 0 0">ファイル選択または手動録画から、コマ送りでリリース点・到達点を自分で指定する精密モードです。クイック計測で録画した動画はここに自動で読み込まれます。</p>
     </div>
-    <div class="row-label">リリース補正（手前で離れる分） <span id="corrVal">1.2m</span></div>
-    <input type="range" id="corr" min="0" max="3" step="0.1" value="1.2">
-    <div id="result" class="result">
-      <div class="muted small">リリース点と到達点を設定すると球速が表示されます</div>
+
+    <div class="card">
+      <h2>1. 動画を読み込む</h2>
+      <div class="seg" id="modeSeg">
+        <button data-mode="file" class="active">ファイルから選ぶ</button>
+        <button data-mode="camera">カメラで撮る</button>
+      </div>
+      <div id="filePanel" style="margin-top:10px">
+        <label class="btn btn-primary file-btn">動画ファイルを選ぶ
+          <input type="file" id="fileInput" accept="video/*" hidden>
+        </label>
+        <p id="fileName" class="muted small">未選択</p>
+      </div>
+      <div id="camPanel" hidden style="margin-top:10px">
+        <video id="camVideo" playsinline muted autoplay></video>
+        <p id="camStatus" class="muted small">カメラを起動します…</p>
+        <p id="camFps" class="muted small"></p>
+        <div class="mark-row" style="margin-top:8px">
+          <button class="btn btn-primary" id="recStart">録画開始</button>
+          <button class="btn btn-accent" id="recStop" disabled>録画停止</button>
+        </div>
+        <p id="recInfo" class="muted small"></p>
+      </div>
+      <p id="modeMsg" class="err" hidden></p>
+      <details class="guide">
+        <summary>撮影ガイドを見る</summary>
+        <ul>
+          <li>三塁側（投手の利き腕と逆側）から横に構えて撮影する</li>
+          <li>スローモーション（240fps）で撮ると推定精度が約±1%になる</li>
+          <li>リリースから捕球（ミット到達）までボールが画面から切れない構図にする</li>
+          <li>三脚などでスマホを固定し、明るい場所で撮る</li>
+          <li>ボールが見やすい単色の背景（ネット・フェンス等）がよい</li>
+          <li>アプリ内撮影は端末・ブラウザ仕様で最大60fps程度のため、240fps級の精度が要る場合はカメラアプリのスローモーション撮影＋ファイル選択が推奨</li>
+        </ul>
+      </details>
+    </div>
+
+    <div class="card">
+      <h2>2. コマ送り</h2>
+      <div id="noVideo" class="muted small">動画を読み込むとここに表示されます（タップで再生/一時停止）</div>
+      <video id="video" playsinline preload="metadata" hidden></video>
+      <input type="range" id="seek" min="0" max="0" value="0" step="1" disabled>
+      <div id="frameInfo" class="muted small">フレーム - / -</div>
+      <div class="ctl-row">
+        <button class="btn" id="back10" disabled>-10</button>
+        <button class="btn" id="back1" disabled>-1</button>
+        <button class="btn btn-primary" id="playBtn" disabled>再生</button>
+        <button class="btn" id="fwd1" disabled>+1</button>
+        <button class="btn" id="fwd10" disabled>+10</button>
+      </div>
+      <div class="row-label">動画のfps（撮影時の設定）</div>
+      <div class="seg" id="fpsSeg">
+        <button data-fps="30">30</button>
+        <button data-fps="60" class="active">60</button>
+        <button data-fps="120">120</button>
+        <button data-fps="240">240</button>
+      </div>
+      <div class="row-label">再生速度</div>
+      <div class="seg" id="speedSeg">
+        <button data-rate="1" class="active">1x</button>
+        <button data-rate="0.5">0.5x</button>
+        <button data-rate="0.25">0.25x</button>
+        <button data-rate="0.1">0.1x</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>3. 測定（2フレーム指定）</h2>
+      <div class="mark-row">
+        <div>
+          <button class="btn btn-accent" id="markRelease" disabled>リリース点に設定</button>
+          <div id="releaseInfo" class="muted small">未設定</div>
+        </div>
+        <div>
+          <button class="btn btn-accent2" id="markArrival" disabled>到達点に設定</button>
+          <div id="arrivalInfo" class="muted small">未設定</div>
+        </div>
+      </div>
+      <div class="row-label">投球距離プリセット</div>
+      <select id="distPreset">
+        <option value="18.44">18.44m（一般・高校・中学）</option>
+        <option value="16.46">16.46m（少年野球）</option>
+        <option value="14.02">14.02m（学童）</option>
+        <option value="custom">カスタム入力</option>
+      </select>
+      <div id="customWrap" hidden>
+        <input type="number" id="customDist" min="1" max="30" step="0.01" placeholder="距離を入力（m）">
+      </div>
+      <div class="row-label">リリース補正（手前で離れる分） <span id="corrVal">1.2m</span></div>
+      <input type="range" id="corr" min="0" max="3" step="0.1" value="1.2">
+      <div id="result" class="result">
+        <div class="muted small">リリース点と到達点を設定すると球速が表示されます</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>4. 保存と共有</h2>
+      <input type="text" id="playerName" placeholder="選手名（例：山田 太郎）" maxlength="20">
+      <button class="btn btn-primary" id="saveBtn" disabled style="width:100%">この計測を保存する</button>
+      <button class="btn" id="shareCurrentBtn" disabled style="width:100%;margin-top:8px">選手名入りの共有画像をダウンロード（1080x1080）</button>
+    </div>
+
+    <div class="card">
+      <h2>5. 結果リスト（端末内に日付単位で保存）</h2>
+      <input type="date" id="listDate">
+      <div id="stats" class="stats"></div>
+      <ul id="recordList" class="records"></ul>
     </div>
   </section>
 
-  <section class="card">
-    <h2>4. 保存と共有</h2>
-    <input type="text" id="playerName" placeholder="選手名（例：山田 太郎）" maxlength="20">
-    <button class="btn btn-primary" id="saveBtn" disabled style="width:100%">この計測を保存する</button>
-    <button class="btn" id="shareCurrentBtn" disabled style="width:100%;margin-top:8px">選手名入りの共有画像をダウンロード（1080x1080）</button>
-  </section>
-
-  <section class="card">
-    <h2>5. 結果リスト（端末内に日付単位で保存）</h2>
-    <input type="date" id="listDate">
-    <div id="stats" class="stats"></div>
-    <ul id="recordList" class="records"></ul>
-  </section>
-
-  <footer class="muted small center">キュウソク v0.1 — 計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.3 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
+
+<script>
+/* ==KYU-PURE-BEGIN==
+   球速計測の純粋計算ロジック（DOM非依存。単体テスト対象） */
+var KYU=(function(){
+  // 自動録画ゲートの閾値（誤作動しにくいよう高めに設定）
+  var SAMPLE_MS=50;        // 監視サンプリング間隔
+  var TRIG_MIN=9;          // 動き検知の絶対下限（グレースケール平均差分 0-255 換算）
+  var TRIG_RATIO=3;        // 通常時ノイズ baseline の何倍で「大きな動き」とみなすか
+  var TRIG_STREAK=3;       // 連続何サンプルで録画開始するか（約150ms）
+  var QUIET_ABS=3.5;       // 録画中「動きが収まった」とみなす絶対閾値
+  var QUIET_RATIO=1.8;     // 同・baseline 比
+  var QUIET_MS=1500;       // この時間だけ静止が続いたら自動停止
+  var MAX_REC_MS=12000;    // 最大録画時間（安全弁）
+  var ARM_MS=1000;         // 停止後この時間は再検知しない（再誤作動防止）
+
+  // 2枚のグレースケール配列の平均絶対差分
+  function grayDiff(a,b){
+    var s=0;
+    for(var i=0;i<a.length;i++){ var d=a[i]-b[i]; s+=d<0?-d:d; }
+    return s/a.length;
+  }
+
+  // 自動録画ゲートの状態機械。g を破壊的に更新し 'start'/'stop'/null を返す
+  function newGate(){
+    return {mode:'idle', baseline:2, high:0, quiet:0, recStart:0, lastStop:-1e12};
+  }
+  function gateUpdate(g,diff,now){
+    if(g.mode==='idle'){
+      if(diff<TRIG_MIN){ g.baseline=g.baseline*0.95+diff*0.05; }
+      if(diff>=TRIG_MIN && diff>=g.baseline*TRIG_RATIO){ g.high++; }else{ g.high=0; }
+      if(g.high>=TRIG_STREAK && now-g.lastStop>=ARM_MS){
+        g.mode='recording'; g.recStart=now; g.quiet=0; g.high=0;
+        return 'start';
+      }
+      return null;
+    }
+    // recording
+    var qmax=Math.max(QUIET_ABS, g.baseline*QUIET_RATIO);
+    g.quiet = diff<=qmax ? g.quiet+SAMPLE_MS : 0;
+    if(g.quiet>=QUIET_MS || now-g.recStart>=MAX_REC_MS){
+      g.mode='idle'; g.lastStop=now;
+      return 'stop';
+    }
+    return null;
+  }
+
+  // 移動平均スムージング
+  function smooth(a,w){
+    var n=a.length, out=new Float32Array(n), h=Math.floor(w/2), i, j, s, c;
+    for(i=0;i<n;i++){
+      s=0; c=0;
+      for(j=Math.max(0,i-h); j<=Math.min(n-1,i+h); j++){ s+=a[j]; c++; }
+      out[i]=s/c;
+    }
+    return out;
+  }
+
+  // フレーム単位の動き量列からリリース/到達フレームを推定するヒューリスティクス
+  // motion: フレームごとの差分量, fps: 動画fps, audioPeakSec: 音声最大ピーク時刻(無ければnull)
+  function estimateFrames(motion,fps,audioPeakSec){
+    var n=motion.length;
+    if(n<2){ return {releaseIdx:0, arrivalIdx:Math.max(1,n-1), arrivalSource:'fallback'}; }
+    var sm=smooth(motion,5);
+    var peak=0, pv=-1, i;
+    for(i=0;i<n;i++){ if(sm[i]>pv){ pv=sm[i]; peak=i; } }
+    // リリース = 投球動作の動き量ピーク付近
+    var releaseIdx = pv>=1 ? peak : Math.floor(n*0.25);
+    var arrivalIdx=-1, source='motion';
+    // 到達第一候補 = 音声最大ピーク（ミット捕球音）
+    if(typeof audioPeakSec==='number' && isFinite(audioPeakSec) && audioPeakSec>0){
+      var af=Math.round(audioPeakSec*fps);
+      if(af>releaseIdx && af<n){ arrivalIdx=af; source='audio'; }
+    }
+    // 到達フォールバック = リリース以降で動きが急停止したフレーム
+    if(arrivalIdx<0){
+      var bestDrop=-1, bi=-1;
+      for(var j=releaseIdx+2;j<n;j++){
+        if(sm[j]<pv*0.5){
+          var d=sm[j-1]-sm[j];
+          if(d>bestDrop){ bestDrop=d; bi=j; }
+        }
+      }
+      if(bi>releaseIdx && bestDrop>0){ arrivalIdx=bi; source='motion'; }
+    }
+    if(arrivalIdx<=releaseIdx){
+      arrivalIdx=Math.min(n-1, releaseIdx+Math.max(2,Math.round(fps*0.3)));
+      source='fallback';
+    }
+    return {releaseIdx:releaseIdx, arrivalIdx:arrivalIdx, arrivalSource:source};
+  }
+
+  // 音声PCMのエンベロープ最大ピークを探す。winSecごとの最大絶対値の列から最大を取る
+  function envelopePeak(ch,sampleRate,winSec){
+    var win=Math.max(1,Math.round(sampleRate*winSec));
+    var n=Math.floor(ch.length/win);
+    if(n<1) return {ok:false, peakSec:0, peakVal:0, median:0};
+    var env=new Float32Array(n), i, w, m, a;
+    for(w=0;w<n;w++){
+      m=0;
+      for(i=w*win;i<(w+1)*win;i++){ a=Math.abs(ch[i]); if(a>m) m=a; }
+      env[w]=m;
+    }
+    var sorted=Array.prototype.slice.call(env).sort(function(x,y){ return x-y; });
+    var median=sorted[Math.floor(n/2)];
+    var pi=0, pv=0;
+    for(i=0;i<n;i++){ if(env[i]>pv){ pv=env[i]; pi=i; } }
+    var ok = pv>0.08 && pv>median*3;
+    return {ok:ok, peakSec:pi*win/sampleRate, peakVal:pv, median:median};
+  }
+
+  // 検出フレームレートを 30/60/120/240 のどれかに丸める
+  function nearestFps(fr){
+    var opts=[30,60,120,240], best=60, bd=1e12, i, d;
+    for(i=0;i<opts.length;i++){ d=Math.abs(opts[i]-fr); if(d<bd){ bd=d; best=opts[i]; } }
+    return best;
+  }
+
+  // 球速計算: effM ÷ (frames/fps) 秒 → km/h
+  function speedKmh(effM,frames,fps){
+    if(!(frames>0) || !(fps>0) || !(effM>0)) return 0;
+    return effM/(frames/fps)*3.6;
+  }
+
+  return {
+    SAMPLE_MS:SAMPLE_MS, TRIG_MIN:TRIG_MIN, TRIG_RATIO:TRIG_RATIO, TRIG_STREAK:TRIG_STREAK,
+    QUIET_ABS:QUIET_ABS, QUIET_RATIO:QUIET_RATIO, QUIET_MS:QUIET_MS, MAX_REC_MS:MAX_REC_MS, ARM_MS:ARM_MS,
+    grayDiff:grayDiff, newGate:newGate, gateUpdate:gateUpdate, smooth:smooth,
+    estimateFrames:estimateFrames, envelopePeak:envelopePeak, nearestFps:nearestFps, speedKmh:speedKmh
+  };
+})();
+if(typeof module!=='undefined' && module.exports){ module.exports=KYU; }
+/* ==KYU-PURE-END== */
+</script>
 
 <script>
 (function(){
 'use strict';
 var LS_KEY='kyusoku.results.v1';
+var QLS_KEY='kyusoku.quick.v1';
 var FONT='"Hiragino Kaku Gothic ProN","Hiragino Sans","Noto Sans JP",Meiryo,sans-serif';
+var MON_W=80, MON_H=45;      // 監視用小キャンバス
+var SCAN_W=64, SCAN_H=36;     // 解析用キャンバス
+var SCAN_MAX_SEC=10;          // 解析対象の最大秒数
 function $(id){return document.getElementById(id);}
 var els={
+  viewSeg:$('viewSeg'), quickView:$('quickView'), detailView:$('detailView'), backToQuick:$('backToQuick'),
+  qStatus:$('qStatus'), quickVideo:$('quickVideo'), qMon:$('qMon'), analyzeVideo:$('analyzeVideo'),
+  qCamMsg:$('qCamMsg'), qCamInfo:$('qCamInfo'), qRetryCam:$('qRetryCam'), qToFile:$('qToFile'),
+  qDistPreset:$('qDistPreset'), qCustomWrap:$('qCustomWrap'), qCustomDist:$('qCustomDist'),
+  qCorr:$('qCorr'), qCorrVal:$('qCorrVal'),
+  qResultCard:$('qResultCard'), qResult:$('qResult'),
+  qRelMinus:$('qRelMinus'), qRelPlus:$('qRelPlus'), qArrMinus:$('qArrMinus'), qArrPlus:$('qArrPlus'),
+  qRelInfo:$('qRelInfo'), qArrInfo:$('qArrInfo'), qArrSource:$('qArrSource'),
+  qPlayerName:$('qPlayerName'), qShareBtn:$('qShareBtn'), qDetailBtn:$('qDetailBtn'), qAgainBtn:$('qAgainBtn'),
   video:$('video'), file:$('fileInput'), fileName:$('fileName'), noVideo:$('noVideo'),
   modeSeg:$('modeSeg'), filePanel:$('filePanel'), camPanel:$('camPanel'),
   camVideo:$('camVideo'), camStatus:$('camStatus'), camFps:$('camFps'),
@@ -237,7 +511,9 @@ var els={
   listDate:$('listDate'), stats:$('stats'), recordList:$('recordList'), toast:$('toast')
 };
 
-var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, loaded:false, seeking:false };
+var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', loaded:false, seeking:false, view:'quick', lastSavedId:null };
+var q={ stream:null, starting:false, monitor:null, prev:null, gate:KYU.newGate(),
+      mode:'off', mediaRec:null, chunks:[], mime:'', recStartAt:0, blob:null, recId:null, arrivalSource:'', analyzeUrl:null };
 var objectUrl=null;
 var dragging=false;
 var camStream=null, camStarting=false, mediaRec=null, recChunks=[], recActive=false, recMime='', recTimer=null, recStartAt=0;
@@ -254,6 +530,10 @@ function dateLabel(key){ var p=key.split('-'); return p[0]+'年'+Number(p[1])+'�
 
 function loadAll(){ try{ var d=JSON.parse(localStorage.getItem(LS_KEY)); return (d&&typeof d==='object')?d:{}; }catch(e){ return {}; } }
 function saveAll(d){ try{ localStorage.setItem(LS_KEY, JSON.stringify(d)); }catch(e){ toast('保存に失敗しました（容量不足の可能性があります）'); } }
+function loadQuickSettings(){ try{ var d=JSON.parse(localStorage.getItem(QLS_KEY)); return (d&&typeof d==='object')?d:{}; }catch(e){ return {}; } }
+function saveQuickSettings(){
+  try{ localStorage.setItem(QLS_KEY, JSON.stringify({dist:state.distPreset, custom:state.customDist, corr:state.correction, name:els.qPlayerName.value})); }catch(e){}
+}
 
 function toast(msg){
   els.toast.textContent=msg; els.toast.hidden=false;
@@ -264,12 +544,446 @@ function setControlsEnabled(on){
   ['back10','back1','playBtn','fwd1','fwd10','markRelease','markArrival','seek'].forEach(function(id){ els[id].disabled=!on; });
 }
 
-/* ---- 動画読み込み（端末内のみ） ---- */
+/* ---- 距離プリセット / リリース補正（クイックと詳細で共有・localStorage復元） ---- */
+function syncDistUI(){
+  els.qDistPreset.value=state.distPreset; els.distPreset.value=state.distPreset;
+  els.qCustomDist.value=state.customDist; els.customDist.value=state.customDist;
+  var cw = state.distPreset!=='custom';
+  els.qCustomWrap.hidden=cw; els.customWrap.hidden=cw;
+  els.qCorr.value=state.correction; els.corr.value=state.correction;
+  var lbl=state.correction.toFixed(1)+'m';
+  els.qCorrVal.textContent=lbl; els.corrVal.textContent=lbl;
+}
+els.qDistPreset.addEventListener('change', function(){ state.distPreset=els.qDistPreset.value; syncDistUI(); saveQuickSettings(); updateResult(); });
+els.distPreset.addEventListener('change', function(){ state.distPreset=els.distPreset.value; syncDistUI(); saveQuickSettings(); updateResult(); });
+els.qCustomDist.addEventListener('input', function(){ state.customDist=els.qCustomDist.value; els.customDist.value=state.customDist; saveQuickSettings(); updateResult(); });
+els.customDist.addEventListener('input', function(){ state.customDist=els.customDist.value; els.qCustomDist.value=state.customDist; saveQuickSettings(); updateResult(); });
+els.qCorr.addEventListener('input', function(){ state.correction=Number(els.qCorr.value); syncDistUI(); saveQuickSettings(); updateResult(); });
+els.corr.addEventListener('input', function(){ state.correction=Number(els.corr.value); syncDistUI(); saveQuickSettings(); updateResult(); });
+function selectedDistance(){
+  if(state.distPreset==='custom'){
+    var v=parseFloat(state.customDist);
+    return (isFinite(v) && v>0) ? v : null;
+  }
+  return parseFloat(state.distPreset);
+}
+function effectiveDistance(){
+  var d=selectedDistance();
+  return d==null ? null : d-state.correction;
+}
+
+/* ---- ビュー切替（クイック計測 / 詳しく測る） ---- */
+function setView(v){
+  state.view=v;
+  Array.prototype.forEach.call(els.viewSeg.children, function(x){ x.classList.toggle('active', x.dataset.view===v); });
+  els.quickView.hidden = v!=='quick';
+  els.detailView.hidden = v!=='detail';
+  if(v==='quick'){ startQuickCamera(); }
+  else{
+    if(q.mode==='recording' && q.mediaRec){ try{ q.mediaRec.onstop=null; q.mediaRec.stop(); }catch(e){} q.mode='off'; }
+    stopQuickCamera();
+  }
+}
+els.viewSeg.addEventListener('click', function(e){
+  var b=e.target.closest('button'); if(!b) return;
+  setView(b.dataset.view);
+});
+els.backToQuick.addEventListener('click', function(){ setView('quick'); });
+
+/* ---- クイック計測: ステータス表示 ---- */
+function setQStatus(mode, text, sub){
+  var map={boot:'st-boot', idle:'st-idle', rec:'st-rec', ana:'st-ana', done:'st-done', err:'st-err'};
+  els.qStatus.className='qstatus '+(map[mode]||'st-idle');
+  els.qStatus.innerHTML=text+(sub?'<span class="qsub">'+sub+'</span>':'');
+}
+function qCamError(msg){
+  setQStatus('err','カメラを使えません', msg);
+  els.qCamMsg.textContent=msg;
+  els.qCamMsg.hidden=false;
+  els.qRetryCam.hidden=false;
+  els.qToFile.hidden=false;
+  els.qCamInfo.textContent='';
+}
+els.qRetryCam.addEventListener('click', function(){ els.qCamMsg.hidden=true; els.qRetryCam.hidden=true; els.qToFile.hidden=true; startQuickCamera(); });
+els.qToFile.addEventListener('click', function(){ setMode('file'); setView('detail'); });
+
+/* ---- クイック計測: カメラ起動（背面・60fps狙い・音声あり） ---- */
+function stopQuickCamera(){
+  if(q.monitor){ clearInterval(q.monitor); q.monitor=null; }
+  if(q.stream){ q.stream.getTracks().forEach(function(t){ t.stop(); }); q.stream=null; }
+  if(els.quickVideo.srcObject){ els.quickVideo.srcObject=null; }
+  q.starting=false; q.mode='off'; q.prev=null;
+}
+function startQuickCamera(){
+  if(q.stream){
+    if(q.mode==='off'){ q.mode='idle'; q.gate=KYU.newGate(); startMonitor(); setQStatus('idle','待機中','投球動作を検知すると自動で録画します'); }
+    return;
+  }
+  if(q.starting) return;
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    qCamError(window.isSecureContext===false
+      ? '安全な接続（HTTPS）で開かれていないためカメラを使えません。「ファイルから詳しく測る」をご利用ください。'
+      : 'このブラウザはカメラ（getUserMedia）に対応していないためクイック計測は使えません。「ファイルから詳しく測る」をご利用ください。');
+    return;
+  }
+  if(typeof MediaRecorder==='undefined'){
+    qCamError('このブラウザは録画（MediaRecorder）に対応していないためクイック計測は使えません。「ファイルから詳しく測る」をご利用ください。');
+    return;
+  }
+  q.starting=true;
+  setQStatus('boot','カメラを起動しています…');
+  var constraints={ audio:true, video:{ facingMode:'environment', frameRate:{ ideal:60 } } };
+  navigator.mediaDevices.getUserMedia(constraints).then(function(stream){
+    q.starting=false;
+    q.stream=stream;
+    els.quickVideo.srcObject=stream;
+    var p=els.quickVideo.play(); if(p && p.catch) p.catch(function(){});
+    var t=stream.getVideoTracks()[0];
+    var st=(t && t.getSettings) ? t.getSettings() : null;
+    var fr=(st && typeof st.frameRate==='number' && st.frameRate>0) ? st.frameRate : null;
+    if(fr){ setFpsByValue(KYU.nearestFps(fr)); els.qCamInfo.textContent='背面カメラ約'+fr.toFixed(1)+'fps ・ 自動録画ON（ボタン操作なし） ・ 距離/補正は前回値を復元済み'; }
+    else{ els.qCamInfo.textContent='自動録画ON（ボタン操作なし） ・ fpsは手動選択のまま ・ 距離/補正は前回値を復元済み'; }
+    els.qCamMsg.hidden=true; els.qRetryCam.hidden=true; els.qToFile.hidden=true;
+    q.mode='idle'; q.gate=KYU.newGate(); q.prev=null;
+    startMonitor();
+    setQStatus('idle','待機中','投球動作を検知すると自動で録画します');
+  }).catch(function(err){
+    q.starting=false;
+    stopQuickCamera();
+    var map={
+      NotAllowedError:'カメラとマイクの使用が拒否されました。ブラウザの設定でこのサイトのカメラ・マイクを「許可」にしてください。',
+      NotFoundError:'カメラが見つかりません。カメラ搭載の端末で開いてください。',
+      OverconstrainedError:'この端末では背面カメラ（facingMode: environment）を開けませんでした。',
+      NotReadableError:'カメラが他のアプリで使用中の可能性があります。他のアプリを閉じてからお試しください。',
+      SecurityError:'セキュリティ上の理由でカメラを使えません。'
+    };
+    qCamError((map[err && err.name] || ('カメラの起動に失敗しました（'+(err && err.name || 'Error')+'）')));
+  });
+}
+
+/* ---- クイック計測: フレーム差分監視（自動録画トリガ） ---- */
+var qMonCtx=els.qMon.getContext('2d',{willReadFrequently:true});
+function startMonitor(){
+  if(q.monitor) return;
+  q.monitor=setInterval(qTick, KYU.SAMPLE_MS);
+}
+function qTick(){
+  if(document.hidden) return;
+  if(state.view!=='quick') return;
+  if(q.mode!=='idle' && q.mode!=='recording') return;
+  var v=els.quickVideo;
+  if(!q.stream || v.readyState<2) return;
+  try{ qMonCtx.drawImage(v,0,0,MON_W,MON_H); }catch(e){ return; }
+  var d=qMonCtx.getImageData(0,0,MON_W,MON_H).data;
+  var g=new Uint8Array(MON_W*MON_H);
+  for(var p=0;p<g.length;p++){ var o=p*4; g[p]=(d[o]*77+d[o+1]*150+d[o+2]*29)>>8; }
+  var diff=q.prev ? KYU.grayDiff(q.prev,g) : 0;
+  q.prev=g;
+  var now=performance.now();
+  var act=KYU.gateUpdate(q.gate, diff, now);
+  if(act==='start'){ qStartRec(); }
+  else if(act==='stop'){ qStopRec(); }
+  if(q.mode==='recording'){
+    setQStatus('rec','録画中… '+((now-q.recStartAt)/1000).toFixed(1)+'s','動きが収まって約1.5秒後に自動停止します');
+  }
+}
+
+/* ---- クイック計測: MediaRecorder 自動録画 ---- */
+function pickRecMime(){
+  var cands=['video/mp4','video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];
+  for(var i=0;i<cands.length;i++){
+    if(MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(cands[i])) return cands[i];
+  }
+  return '';
+}
+function qStartRec(){
+  if(!q.stream) return;
+  q.chunks=[];
+  var mime=pickRecMime();
+  try{
+    q.mediaRec = mime ? new MediaRecorder(q.stream,{mimeType:mime}) : new MediaRecorder(q.stream);
+  }catch(e){
+    setQStatus('err','録画を開始できませんでした', String(e && e.name || e));
+    q.mode='idle'; q.gate=KYU.newGate();
+    return;
+  }
+  q.mime=q.mediaRec.mimeType || mime || 'video/webm';
+  q.mediaRec.ondataavailable=function(e){ if(e.data && e.data.size>0) q.chunks.push(e.data); };
+  q.mediaRec.onstop=qOnRecStop;
+  try{ q.mediaRec.start(250); }catch(e){
+    q.mode='idle'; q.gate=KYU.newGate();
+    setQStatus('err','録画を開始できませんでした', String(e && e.name || e));
+    return;
+  }
+  q.mode='recording';
+  q.recStartAt=performance.now();
+  els.qResultCard.hidden=true;
+  setQStatus('rec','録画中… 0.0s','動きが収まって約1.5秒後に自動停止します');
+}
+function qStopRec(){
+  q.mode='analyzing';
+  setQStatus('ana','解析中…','録画を自動停止しました');
+  if(q.mediaRec && q.mediaRec.state!=='inactive'){ try{ q.mediaRec.stop(); }catch(e){ qOnRecStop(); } }
+  else{ qOnRecStop(); }
+}
+function qOnRecStop(){
+  var blob=new Blob(q.chunks,{type:q.mime});
+  q.chunks=[];
+  qAnalyze(blob).catch(function(e){
+    setQStatus('err','解析に失敗しました', String(e && e.message || e));
+    q.mode='idle'; q.gate=KYU.newGate(); q.gate.lastStop=performance.now();
+  });
+}
+
+/* ---- クイック計測: 自動解析（映像動き + 音声ピーク → フレーム推定） ---- */
+function seekVideo(v,t){
+  return new Promise(function(res){
+    if(!isFinite(v.duration)){ res(); return; }
+    t=Math.max(0, Math.min(t, v.duration));
+    if(Math.abs(v.currentTime-t)<1e-4){ res(); return; }
+    var done=false;
+    var on=function(){ if(done) return; done=true; v.removeEventListener('seeked', on); res(); };
+    v.addEventListener('seeked', on);
+    setTimeout(on, 1200);
+    v.currentTime=t;
+  });
+}
+function waitMeta(v){
+  return new Promise(function(res,rej){
+    if(v.readyState>=1 && isFinite(v.duration)){ res(); return; }
+    var on=function(){ v.removeEventListener('loadedmetadata', on); res(); };
+    var oe=function(){ v.removeEventListener('error', oe); rej(new Error('動画メタデータの読み込みに失敗しました')); };
+    v.addEventListener('loadedmetadata', on);
+    v.addEventListener('error', oe);
+    setTimeout(function(){ rej(new Error('動画メタデータの読み込みがタイムアウトしました')); }, 8000);
+  });
+}
+function scanMotion(v,fps,progress){
+  return new Promise(function(res,rej){
+    try{
+      var c=document.createElement('canvas'); c.width=SCAN_W; c.height=SCAN_H;
+      var x=c.getContext('2d',{willReadFrequently:true});
+      var dur=Math.min(v.duration||0, SCAN_MAX_SEC);
+      var n=Math.max(1, Math.round(dur*fps));
+      var motion=new Float32Array(n);
+      var prev=null;
+      var i=0;
+      function stepOne(){
+        if(i>=n){ res(motion); return; }
+        seekVideo(v, i/fps).then(function(){
+          try{ x.drawImage(v,0,0,SCAN_W,SCAN_H); }catch(e){ motion[i]=0; i++; stepOne(); return; }
+          var d=x.getImageData(0,0,SCAN_W,SCAN_H).data;
+          var g=new Uint8Array(SCAN_W*SCAN_H);
+          for(var p=0;p<g.length;p++){ var o=p*4; g[p]=(d[o]*77+d[o+1]*150+d[o+2]*29)>>8; }
+          if(prev) motion[i]=KYU.grayDiff(prev,g);
+          prev=g;
+          if(i%10===0){
+            progress(Math.round(i/n*100));
+            setTimeout(stepOne,0);
+          }else{
+            i++; stepOne();
+          }
+        }).catch(function(){ i++; stepOne(); });
+      }
+      stepOne();
+    }catch(e){ rej(e); }
+  });
+}
+function scanAudio(blob){
+  return blob.arrayBuffer().then(function(buf){
+    var AC=window.AudioContext||window.webkitAudioContext;
+    if(!AC) return {ok:false};
+    var ctx=new AC();
+    return ctx.decodeAudioData(buf.slice(0)).then(function(audio){
+      var n=audio.length, c, i;
+      var mix;
+      if(audio.numberOfChannels>1){
+        mix=new Float32Array(n);
+        for(c=0;c<audio.numberOfChannels;c++){
+          var ch=audio.getChannelData(c);
+          for(i=0;i<n;i++){ mix[i]+=ch[i]/audio.numberOfChannels; }
+        }
+      }else{
+        mix=audio.getChannelData(0);
+      }
+      var r=KYU.envelopePeak(mix, audio.sampleRate, 0.005);
+      try{ ctx.close(); }catch(e){}
+      return r;
+    }).catch(function(){ try{ ctx.close(); }catch(e){} return {ok:false}; });
+  }).catch(function(){ return {ok:false}; });
+}
+function qAnalyze(blob){
+  q.blob=blob;
+  if(blob.size<20000){
+    setQStatus('idle','待機中','録画が短すぎたため破棄しました。もう一度投げてください');
+    q.mode='idle'; q.gate=KYU.newGate(); q.gate.lastStop=performance.now();
+    return Promise.resolve();
+  }
+  setQStatus('ana','解析中…','映像と音声からリリース/到達フレームを推定しています');
+  if(q.analyzeUrl) URL.revokeObjectURL(q.analyzeUrl);
+  q.analyzeUrl=URL.createObjectURL(blob);
+  var v=els.analyzeVideo;
+  v.src=q.analyzeUrl;
+  v.load();
+  return waitMeta(v).then(function(){
+    if(!v.duration || v.duration<0.8){
+      setQStatus('idle','待機中','録画時間が短すぎるため破棄しました（0.8s未満）。もう一度投げてください');
+      q.mode='idle'; q.gate=KYU.newGate(); q.gate.lastStop=performance.now();
+      return null;
+    }
+    var fps=state.fps;
+    return scanMotion(v, fps, function(pct){ setQStatus('ana','解析中… '+pct+'%','映像の動き量を解析しています'); }).then(function(motion){
+      setQStatus('ana','解析中…','音声の捕球音ピークを解析しています');
+      return scanAudio(blob).then(function(audio){
+        var est=KYU.estimateFrames(motion, fps, (audio && audio.ok) ? audio.peakSec : null);
+        state.releaseTime=est.releaseIdx/fps;
+        state.arrivalTime=est.arrivalIdx/fps;
+        q.arrivalSource=est.arrivalSource;
+        els.qResultCard.hidden=false; // 結果パネルを先に可視化してから描画する
+        // 詳しく測る用に同じ動画を詳細ビューへも読み込む
+        loadDetailVideo(blob, 'クイック計測の録画', true);
+        updateMarks(); updateResult();
+        autoSaveQuick(false);
+        els.qResultCard.scrollIntoView({behavior:'smooth', block:'start'}); // 計測確定の瞬間に結果パネルを画面の主役にする
+        setQStatus('done','計測完了','次の投球を検知すると自動で再計測します。「詳しく測る」で微調整できます');
+        q.mode='idle'; q.gate=KYU.newGate(); q.gate.lastStop=performance.now();
+        return est;
+      });
+    });
+  });
+}
+
+/* ---- クイック計測: 結果表示・±1F微調整・自動保存・共有 ---- */
+function markText(t){
+  if(t==null) return '未設定';
+  return 'F'+pad(Math.round(t*state.fps),4)+'（'+t.toFixed(3)+'s）';
+}
+/* ---- 結果パネル（TrackMan風ダッシュボード） 共通描画 ---- */
+var lastResultStatus='init';
+// その日の統計（保存済み記録から現在の計測を除外してから現在値を加える＝二重カウント防止）
+function dayStats(excludeId, includeKmh){
+  var key=todayKey();
+  var list=(loadAll()[key]||[]).filter(function(x){ return x.id!==excludeId; });
+  var vals=list.map(function(x){ return x.kmh; });
+  if(typeof includeKmh==='number' && isFinite(includeKmh)) vals.push(includeKmh);
+  if(!vals.length) return {max:null, avg:null, count:0};
+  var max=vals[0], sum=0;
+  vals.forEach(function(v){ if(v>max) max=v; sum+=v; });
+  return {max:max, avg:sum/vals.length, count:vals.length};
+}
+function tile(label, val, sub, accent){
+  return '<div class="tile"><div class="t-label">'+label+'</div>'+
+    '<div class="t-val'+(accent?' t-acc':'')+'">'+val+'</div>'+
+    (sub?'<div class="t-sub">'+sub+'</div>':'')+'</div>';
+}
+// 球速（特大ヒーロー）＋副次指標タイルのグリッドを組み立てる
+function resultPanelHTML(r, excludeId){
+  var st=dayStats(excludeId, r.kmh);
+  var now=new Date();
+  var ms=Math.round(r.timeSec*1000);
+  return '<div class="rpanel">'+
+    '<div class="hero-tile"><div class="hero-val">'+r.kmh.toFixed(1)+'</div><div class="hero-unit">km/h</div></div>'+
+    '<div class="tiles">'+
+      tile('推定精度', '±'+r.accPct.toFixed(1)+'%', '±'+r.accKmh.toFixed(1)+' km/h')+
+      tile('経過フレーム', r.frames+' F', 'F'+pad(r.releaseFrame,4)+' → F'+pad(r.arrivalFrame,4))+
+      tile('経過時間', ms+' ms', r.timeSec.toFixed(3)+' s')+
+      tile('実効距離', r.eff.toFixed(2)+' m', selectedDistance().toFixed(2)+'−'+state.correction.toFixed(1)+'m')+
+      tile('使用fps', state.fps+' fps')+
+      tile('本日 MAX', st.max==null?'-':st.max.toFixed(1), 'km/h', true)+
+      tile('本日 平均', st.avg==null?'-':st.avg.toFixed(1), 'km/h')+
+      tile('球数', String(st.count), '本日')+
+      tile('計測時刻', pad(now.getHours(),2)+':'+pad(now.getMinutes(),2)+':'+pad(now.getSeconds(),2))+
+    '</div></div>';
+}
+function renderQuickResult(){
+  if(els.qResultCard.hidden) return;
+  var r=computeResult();
+  if(r.status==='incomplete'){
+    els.qResult.innerHTML='<div class="muted small">推定中…</div>';
+  }else if(r.status==='error'){
+    els.qResult.innerHTML='<div class="err">'+r.msg+'</div>';
+  }else{
+    els.qResult.innerHTML=resultPanelHTML(r, q.recId);
+  }
+  els.qRelInfo.textContent=markText(state.releaseTime);
+  els.qArrInfo.textContent=markText(state.arrivalTime);
+  els.qArrSource.textContent = q.arrivalSource==='audio'
+    ? '到達候補: ミット捕球音（音声最大ピーク）から推定'
+    : (q.arrivalSource==='motion' ? '到達候補: 映像の動きが急停止したフレームから推定（音声ピークなし）' : '到達候補: フォールバック推定');
+}
+function nudge(which, delta){
+  if(els.qResultCard.hidden) return;
+  if(which==='release'){
+    if(state.releaseTime==null) return;
+    state.releaseTime=Math.max(0, state.releaseTime + delta/state.fps);
+  }else{
+    if(state.arrivalTime==null) return;
+    state.arrivalTime=Math.max(0, state.arrivalTime + delta/state.fps);
+  }
+  updateMarks(); updateResult(); renderQuickResult();
+  autoSaveQuick(true); // 保存済み記録を即座に更新（球速の再計算結果で上書き）
+}
+els.qRelMinus.addEventListener('click', function(){ nudge('release',-1); });
+els.qRelPlus.addEventListener('click', function(){ nudge('release',1); });
+els.qArrMinus.addEventListener('click', function(){ nudge('arrival',-1); });
+els.qArrPlus.addEventListener('click', function(){ nudge('arrival',1); });
+
+function buildRec(){
+  var r=computeResult();
+  if(r.status!=='ok') return null;
+  return {
+    id: q.recId || (Date.now()+'-'+Math.floor(Math.random()*1e6)),
+    at:new Date().toISOString(),
+    name:els.qPlayerName.value.trim()||'選手',
+    kmh:r.kmh, accPct:r.accPct, accKmh:r.accKmh, eff:r.eff,
+    dist:selectedDistance(), corr:state.correction, fps:state.fps,
+    frames:r.frames, timeSec:r.timeSec,
+    releaseFrame:Math.round(state.releaseTime*state.fps),
+    arrivalFrame:Math.round(state.arrivalTime*state.fps),
+    source:'quick'+(q.arrivalSource?('-'+q.arrivalSource):'')
+  };
+}
+function autoSaveQuick(silent){
+  var rec=buildRec();
+  if(!rec){ if(!silent) toast('自動推定に失敗したため保存しませんでした'); return; }
+  var all=loadAll();
+  var key=todayKey();
+  if(!all[key]) all[key]=[];
+  if(q.recId){
+    var replaced=false;
+    all[key]=all[key].map(function(x){ if(x.id===q.recId){ replaced=true; return rec; } return x; });
+    if(!replaced) all[key].push(rec);
+  }else{
+    q.recId=rec.id;
+    all[key].push(rec);
+  }
+  saveAll(all);
+  renderRecords();
+  if(!silent) toast('計測結果を自動保存しました（'+dateLabel(key)+'）');
+}
+els.qPlayerName.addEventListener('input', function(){ saveQuickSettings(); });
+els.qShareBtn.addEventListener('click', function(){
+  var rec=buildRec();
+  if(!rec){ toast('まだ計測結果がありません'); return; }
+  downloadShareImage(rec);
+});
+els.qDetailBtn.addEventListener('click', function(){
+  if(q.blob) loadDetailVideo(q.blob, 'クイック計測の録画', true);
+  setView('detail');
+});
+els.qAgainBtn.addEventListener('click', function(){
+  els.qResultCard.hidden=true;
+  q.recId=null;
+  q.mode='idle'; q.gate=KYU.newGate(); q.gate.lastStop=performance.now();
+  setQStatus('idle','待機中','投球動作を検知すると自動で録画します');
+});
+
+/* ---- 動画読み込み（端末内のみ・詳細ビュー） ---- */
 els.file.addEventListener('change', function(){
   var f=els.file.files && els.file.files[0];
   if(!f) return;
   hideModeMsg();
-  loadVideoSource(f, f.name);
+  loadDetailVideo(f, f.name, false);
 });
 els.video.addEventListener('loadedmetadata', function(){
   state.loaded=true;
@@ -289,23 +1003,22 @@ els.video.addEventListener('click', function(){
   if(els.video.paused){ els.video.play(); } else { els.video.pause(); }
 });
 
-/* ---- 動画ソース読み込み（ファイル選択 / カメラ録画の共通入口） ---- */
-function loadVideoSource(blob, label){
+/* ---- 動画ソース読み込み（ファイル選択 / カメラ録画 / クイック計測からの引き継ぎ） ---- */
+function loadDetailVideo(blob, label, keepMarks){
   if(camStream) stopCamera();
   if(objectUrl) URL.revokeObjectURL(objectUrl);
   objectUrl=URL.createObjectURL(blob);
-  els.video.srcObject=null;
   els.video.src=objectUrl;
   els.video.load();
   els.fileName.textContent=label+'（'+(blob.size/1048576).toFixed(1)+' MB）';
   state.loaded=false;
-  state.releaseTime=null; state.arrivalTime=null;
+  if(!keepMarks){ state.releaseTime=null; state.arrivalTime=null; }
   setControlsEnabled(false);
   els.seek.max=0; els.seek.value=0;
   updateFrameUI(); updateMarks(); updateResult();
 }
 
-/* ---- 入力モード切替（ファイル / カメラ撮影） ---- */
+/* ---- 入力モード切替（ファイル / カメラ手動撮影・詳細ビュー） ---- */
 function hideModeMsg(){ els.modeMsg.hidden=true; els.modeMsg.textContent=''; }
 function showModeError(msg){
   setMode('file', true);
@@ -326,7 +1039,7 @@ els.modeSeg.addEventListener('click', function(e){
   setMode(b.dataset.mode);
 });
 
-/* ---- カメラ撮影（getUserMedia + MediaRecorder） ---- */
+/* ---- カメラ手動撮影（詳細ビュー・既存フロー） ---- */
 function stopCamera(){
   if(recActive && mediaRec){ try{ mediaRec.stop(); }catch(e){} }
   if(camStream){ camStream.getTracks().forEach(function(t){ t.stop(); }); camStream=null; }
@@ -394,13 +1107,6 @@ function startCamera(){
     return false;
   });
 }
-function pickRecMime(){
-  var cands=['video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'];
-  for(var i=0;i<cands.length;i++){
-    if(MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(cands[i])) return cands[i];
-  }
-  return '';
-}
 function startRecTimer(){
   recStartAt=Date.now();
   recTimer=setInterval(function(){
@@ -445,7 +1151,7 @@ function onRecStop(){
   }
   var ext = recMime.indexOf('mp4')>=0 ? 'mp4' : 'webm';
   stopCamera();
-  loadVideoSource(blob, 'カメラ撮影（'+ext+'）');
+  loadDetailVideo(blob, 'カメラ撮影（'+ext+'）', false);
   els.camStatus.textContent='録画を計測に読み込みました。「録画開始」で再撮影できます';
   els.camFps.textContent='';
   els.recInfo.textContent='';
@@ -510,6 +1216,11 @@ function setFps(fps, btn){
   if(state.loaded){ els.seek.max=totalFrames(); els.seek.value=curFrame(); }
   updateFrameUI(); updateMarks(); updateResult();
 }
+function setFpsByValue(fps){
+  var btn=null;
+  Array.prototype.forEach.call(els.fpsSeg.children, function(x){ if(Number(x.dataset.fps)===fps) btn=x; });
+  setFps(fps, btn || els.fpsSeg.children[1]);
+}
 els.fpsSeg.addEventListener('click', function(e){
   var b=e.target.closest('button'); if(!b) return;
   setFps(Number(b.dataset.fps), b);
@@ -537,36 +1248,9 @@ els.markArrival.addEventListener('click', function(){
   state.arrivalTime=els.video.currentTime;
   updateMarks(); updateResult();
 });
-function markText(t){
-  if(t==null) return '未設定';
-  return 'F'+pad(Math.round(t*state.fps),4)+'（'+t.toFixed(3)+'s）';
-}
 function updateMarks(){
   els.releaseInfo.textContent=markText(state.releaseTime);
   els.arrivalInfo.textContent=markText(state.arrivalTime);
-}
-
-/* ---- 距離・補正 ---- */
-els.distPreset.addEventListener('change', function(){
-  els.customWrap.hidden = els.distPreset.value!=='custom';
-  updateResult();
-});
-els.customDist.addEventListener('input', updateResult);
-els.corr.addEventListener('input', function(){
-  state.correction=Number(els.corr.value);
-  els.corrVal.textContent=state.correction.toFixed(1)+'m';
-  updateResult();
-});
-function selectedDistance(){
-  if(els.distPreset.value==='custom'){
-    var v=parseFloat(els.customDist.value);
-    return (isFinite(v) && v>0) ? v : null;
-  }
-  return parseFloat(els.distPreset.value);
-}
-function effectiveDistance(){
-  var d=selectedDistance();
-  return d==null ? null : d-state.correction;
 }
 
 /* ---- 球速計算 ---- */
@@ -580,10 +1264,10 @@ function computeResult(){
   if(eff==null) return {status:'error', msg:'カスタム距離を入力してください'};
   if(eff<=0) return {status:'error', msg:'実効距離が0以下です。リリース補正を下げてください'};
   var timeSec=frames/state.fps;
-  var kmh=eff/timeSec*3.6;
+  var kmh=KYU.speedKmh(eff, frames, state.fps);
   var accPct=(frameDur()/timeSec)*100;
   return {status:'ok', frames:frames, timeSec:timeSec, eff:eff, kmh:kmh,
-          accPct:accPct, accKmh:kmh*accPct/100};
+          accPct:accPct, accKmh:kmh*accPct/100, releaseFrame:rf, arrivalFrame:af};
 }
 function updateResult(){
   var r=computeResult();
@@ -592,17 +1276,16 @@ function updateResult(){
   }else if(r.status==='error'){
     els.result.innerHTML='<div class="err">'+r.msg+'</div>';
   }else{
-    els.result.innerHTML=
-      '<div class="kmh">'+r.kmh.toFixed(1)+'<span class="unit">km/h</span></div>'+
-      '<div class="muted small">計測時間 '+r.timeSec.toFixed(3)+'s（'+r.frames+'フレーム @ '+state.fps+'fps）</div>'+
-      '<div class="muted small">実効距離 '+r.eff.toFixed(2)+'m ＝ '+selectedDistance().toFixed(2)+'m − 補正 '+state.correction.toFixed(1)+'m</div>'+
-      '<div class="muted small">推定精度 ±'+r.accPct.toFixed(1)+'%（±'+r.accKmh.toFixed(1)+' km/h）※1フレーム分の誤差</div>';
+    els.result.innerHTML=resultPanelHTML(r, state.lastSavedId);
+    if(lastResultStatus!=='ok'){ els.result.scrollIntoView({behavior:'smooth', block:'center'}); } // 計測確定の瞬間に結果パネルを画面の主役にする
   }
+  lastResultStatus=r.status;
   els.saveBtn.disabled = r.status!=='ok';
   els.shareCurrentBtn.disabled = r.status!=='ok';
+  renderQuickResult();
 }
 
-/* ---- 保存（localStorage・日付単位） ---- */
+/* ---- 保存（localStorage・日付単位・手動ボタンは詳細ビュー用） ---- */
 els.saveBtn.addEventListener('click', function(){
   var r=computeResult();
   if(r.status!=='ok') return;
@@ -617,10 +1300,12 @@ els.saveBtn.addEventListener('click', function(){
     dist:selectedDistance(), corr:state.correction, fps:state.fps,
     frames:r.frames, timeSec:r.timeSec,
     releaseFrame:Math.round(state.releaseTime*state.fps),
-    arrivalFrame:Math.round(state.arrivalTime*state.fps)
+    arrivalFrame:Math.round(state.arrivalTime*state.fps),
+    source:'detail'
   };
   all[key].push(rec);
   saveAll(all);
+  state.lastSavedId=rec.id; // 結果パネルの「その日」統計で同一記録の二重カウントを防ぐ
   toast('保存しました（'+dateLabel(key)+'）');
   renderRecords();
 });
@@ -651,7 +1336,8 @@ function renderRecords(){
     top.appendChild(nm); top.appendChild(km);
     var sub=document.createElement('div'); sub.className='rec-sub';
     sub.textContent=pad(d.getHours(),2)+':'+pad(d.getMinutes(),2)+':'+pad(d.getSeconds(),2)+
-      ' ・ '+r.fps+'fps ・ '+r.frames+'F ・ 実効'+r.eff.toFixed(2)+'m ・ ±'+r.accKmh.toFixed(1)+'km/h';
+      ' ・ '+r.fps+'fps ・ '+r.frames+'F ・ 実効'+r.eff.toFixed(2)+'m ・ ±'+r.accKmh.toFixed(1)+'km/h'+
+      (r.source?' ・ '+(r.source.indexOf('quick')===0?'クイック自動推定':'手動計測'):'');
     info.appendChild(top); info.appendChild(sub);
     var btns=document.createElement('div'); btns.className='rec-btns';
     var share=document.createElement('button'); share.className='btn btn-small'; share.textContent='共有画像';
@@ -735,9 +1421,18 @@ els.shareCurrentBtn.addEventListener('click', function(){
 });
 
 /* ---- 初期化 ---- */
-setControlsEnabled(false);
-updateFrameUI(); updateMarks(); updateResult();
-renderRecords();
+(function init(){
+  var qs=loadQuickSettings();
+  if(typeof qs.dist==='string') state.distPreset=qs.dist;
+  if(typeof qs.custom==='string') state.customDist=qs.custom;
+  if(typeof qs.corr==='number' && isFinite(qs.corr)) state.correction=qs.corr;
+  if(typeof qs.name==='string'){ els.qPlayerName.value=qs.name; els.playerName.value=qs.name; }
+  syncDistUI();
+  setControlsEnabled(false);
+  updateFrameUI(); updateMarks(); updateResult();
+  renderRecords();
+  setView('quick'); // 初期画面はクイック計測。カメラを自動起動
+})();
 })();
 </script>
 </body>
