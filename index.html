@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.6 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.7 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -1250,6 +1250,227 @@ var KYU=(function(){
     return speedKmhByTime(effM, frames/fps);
   }
 
+  /* ---- 一括解析用ピュア関数（長時間動画のセグメンテーション。DOM非依存で単体テスト可能） ---- */
+
+  // ロバストな適応しきい値: median + k*MAD（MADが0ならminSpreadで下駄を履かせる）。minValで下限を強制
+  function adaptiveThreshold(vals, opts){
+    opts=opts||{};
+    var n=vals?vals.length:0;
+    var minVal=Number(opts.minVal)||0;
+    if(!n) return minVal;
+    var k=(opts.k!=null)?opts.k:3;
+    var arr=new Array(n), i;
+    for(i=0;i<n;i++){ arr[i]=Number(vals[i])||0; }
+    arr.sort(function(a,b){ return a-b; });
+    var med=arr[Math.floor(n/2)];
+    var dev=new Array(n);
+    for(i=0;i<n;i++){ dev[i]=Math.abs(arr[i]-med); }
+    dev.sort(function(a,b){ return a-b; });
+    var mad=dev[Math.floor(n/2)];
+    var spread=Math.max(mad, Number(opts.minSpread)||0);
+    return Math.max(minVal, med+k*spread);
+  }
+
+  // 候補の統合: {index, score, ...} の列から、index が minInterval 未満に密集した候補を間引き、score 最大のものだけを残す（index昇順で返す）
+  function mergeCandidates(cands, minInterval){
+    if(!cands || !cands.length) return [];
+    var mi=Math.max(1, Math.round(minInterval||1));
+    var list=cands.slice().sort(function(a,b){
+      var s=(Number(b.score)||0)-(Number(a.score)||0);
+      return s!==0 ? s : a.index-b.index;
+    });
+    var kept=[], i, j;
+    for(i=0;i<list.length;i++){
+      var c=list[i], ok=true;
+      for(j=0;j<kept.length;j++){ if(Math.abs(kept[j].index-c.index)<mi){ ok=false; break; } }
+      if(ok) kept.push(c);
+    }
+    kept.sort(function(a,b){ return a.index-b.index; });
+    return kept;
+  }
+
+  // 最小間隔フィルタ: {index, value} のピーク列を minInterval 未満の近接ピークを間引き（強い方を残す）
+  function minIntervalFilter(peaks, minInterval){
+    if(!peaks || !peaks.length) return [];
+    return mergeCandidates(peaks.map(function(p){ return {index:p.index, score:p.value, value:p.value}; }), minInterval)
+      .map(function(c){ return {index:c.index, value:c.value}; });
+  }
+
+  // ピーク検出: （任意で平滑化）→適応しきい値より大きい局所最大を取り、最小間隔フィルタする
+  // opts: {k, minVal, smoothWin, halfWin, minInterval}（minIntervalはサンプル数）
+  function detectPeaks(vals, opts){
+    opts=opts||{};
+    var n=vals?vals.length:0;
+    if(n<3) return [];
+    var a=(opts.smoothWin>1)?smooth(vals, opts.smoothWin):vals;
+    var thr=adaptiveThreshold(a, {k:(opts.k!=null)?opts.k:3, minVal:Number(opts.minVal)||0});
+    var hw=Math.max(1, Math.round(opts.halfWin||1));
+    var mi=Math.max(1, Math.round(opts.minInterval||1));
+    var peaks=[], i, j;
+    for(i=0;i<n;i++){
+      if(!(a[i]>thr)) continue;
+      var isMax=true;
+      var lo=Math.max(0,i-hw), hi=Math.min(n-1,i+hw);
+      for(j=lo;j<=hi;j++){ if(a[j]>a[i]){ isMax=false; break; } }
+      if(isMax) peaks.push({index:i, value:a[i]});
+    }
+    return minIntervalFilter(peaks, mi);
+  }
+
+  // フレーム時刻列から実フレームレートを算出（中央値フレーム間隔の逆数）。無理なら null
+  function fpsFromFrameTimes(times){
+    var d=medianFrameDur(times);
+    if(!d || !isFinite(d) || d<=0) return null;
+    var f=1/d;
+    return (isFinite(f) && f>0) ? f : null;
+  }
+
+  // 0..n を size ごとのチャンク [start,end) の列に分割する（チャンク分割走査用）
+  function chunkRanges(n, size){
+    n=Math.max(0, Math.round(n||0));
+    size=Math.max(1, Math.round(size||1));
+    var out=[], s;
+    for(s=0;s<n;s+=size){ out.push([s, Math.min(n, s+size)]); }
+    return out;
+  }
+
+  // 一括解析セグメンテーション: フレームごとの動き量列と捕球音ピーク(秒)の列から各投球の release/arrival フレームを推定する
+  // motion: フレームごとの動き量列, fps: 実効fps, frameTimes: MP4フレーム時刻列(あれば), audioPeaksSec: 捕球音ピーク時刻(秒・音速補正済み。nullなら動き量のみ)
+  // opts: {lookbackSec=1.5, minIntervalSec=2.0, minMotion, k}
+  // 各捕球ピークから最大lookbackSec遡った範囲の動き量最大位置をリリース候補とする（estimateFrames と同じ考え方）。
+  // 音声が無い場合は動き量バーストをピーク検出し、その低下点を到達候補とするフォールバック。
+  // 候補は minIntervalSec 未満に密集するものを統合する。返り値: [{releaseIdx, arrivalIdx, arrivalSource, motionPeak, confidence}]
+  function segmentPitches(motion, fps, frameTimes, audioPeaksSec, opts){
+    opts=opts||{};
+    var n=motion?motion.length:0;
+    if(n<2 || !(fps>0)) return [];
+    var lookbackSec=(opts.lookbackSec!=null)?opts.lookbackSec:1.5;
+    var minIntervalSec=(opts.minIntervalSec!=null)?opts.minIntervalSec:2.0;
+    var sm=smooth(motion,5);
+    var hasFT=!!(frameTimes && frameTimes.length);
+    var toIdx=function(sec){ return hasFT ? frameIndexAt(frameTimes, sec) : Math.round(sec*fps); };
+    var minGap=Math.max(1, Math.round(minIntervalSec*fps));
+    var minMotion=(opts.minMotion!=null)?opts.minMotion:4;
+    var thr=adaptiveThreshold(sm, {k:2, minVal:0});
+    var cands=[], i, j;
+    var maxSec=hasFT ? frameTimes[n-1] : n/fps; // 動画の最終フレーム時刻。これより後の音声ピークは捨てる
+    if(audioPeaksSec && audioPeaksSec.length){
+      for(i=0;i<audioPeaksSec.length;i++){
+        var sec=audioPeaksSec[i];
+        if(!(sec>0) || !isFinite(sec) || sec>maxSec+1e-6) continue;
+        var ai=Math.max(0, Math.min(n-1, toIdx(sec)));
+        if(ai<1) continue;
+        // リリース候補 = 捕球ピークから最大lookbackSec遡った範囲の動き量最大フレーム
+        var lo=hasFT ? frameIndexAt(frameTimes, Math.max(0, (frameTimes[ai]||0)-lookbackSec))
+                     : Math.max(0, Math.round((sec-lookbackSec)*fps));
+        if(lo>=ai) lo=Math.max(0, ai-1);
+        var ri=lo, rv=-1;
+        for(j=lo;j<=ai;j++){ if(sm[j]>rv){ rv=sm[j]; ri=j; } }
+        if(ri>=ai) ri=ai-1;
+        cands.push({index:ai, score:rv, releaseIdx:ri, arrivalIdx:ai, arrivalSource:'audio',
+                    motionPeak:rv, confidence:(rv>thr)?'high':'low'});
+      }
+    }else{
+      // フォールバック: 映像の動き量バーストのみで切り出す
+      var peaks=detectPeaks(sm, {k:(opts.k!=null)?opts.k:3, minInterval:minGap, minVal:minMotion, smoothWin:0});
+      var tail=Math.max(2, Math.round(1.0*fps));
+      for(i=0;i<peaks.length;i++){
+        var pi=peaks[i].index, pv=peaks[i].value;
+        // 到達 = ピーク以降で動きが半減以下に急落したフレーム（estimateFrames のフォールバックと同じ考え方）
+        var ai2=-1, bestDrop=-1;
+        for(j=pi+2;j<Math.min(n, pi+tail);j++){
+          if(sm[j]<pv*0.5){ var d=sm[j-1]-sm[j]; if(d>bestDrop){ bestDrop=d; ai2=j; } }
+        }
+        if(ai2<=pi) ai2=Math.min(n-1, pi+Math.max(2, Math.round(0.3*fps)));
+        cands.push({index:ai2, score:pv, releaseIdx:pi, arrivalIdx:ai2, arrivalSource:'motion',
+                    motionPeak:pv, confidence:(pv>thr)?'mid':'low'});
+      }
+    }
+    var merged=mergeCandidates(cands, minGap);
+    var out=[];
+    for(i=0;i<merged.length;i++){
+      var c=merged[i];
+      var af2=Math.max(1, Math.min(n-1, c.arrivalIdx));
+      var rf2=Math.max(0, Math.min(c.releaseIdx, af2-1));
+      if(af2<=rf2) continue;
+      out.push({releaseIdx:rf2, arrivalIdx:af2, arrivalSource:c.arrivalSource,
+                motionPeak:c.motionPeak, confidence:c.confidence});
+    }
+    return out;
+  }
+
+  /* ---- 2点タップ校正（幾何）とレターボックス換算、音声読み上げテキストの純粋関数 ---- */
+
+  // 2点 {x,y} のピクセル距離と既知の実世界距離 realDistM[m] から 1m あたりのピクセル数(px/m)を返す。無効なら null
+  function pxPerMeter(p1, p2, realDistM){
+    var d=Number(realDistM);
+    if(!p1 || !p2) return null;
+    if(!isFinite(d) || d<=0) return null;
+    var dx=Number(p2.x)-Number(p1.x), dy=Number(p2.y)-Number(p1.y);
+    if(!isFinite(dx) || !isFinite(dy)) return null;
+    var dist=Math.sqrt(dx*dx+dy*dy);
+    if(!(dist>0) || !isFinite(dist)) return null;
+    return dist/d;
+  }
+
+  // 投球プレート点とリリース点のピクセル距離 ÷ pxPerM でリリース前進距離(m)を返す。pxPerM は pxPerMeter の結果。無効なら null
+  function releaseAdvanceM(platePt, releasePt, pxPerM){
+    var ppm=Number(pxPerM);
+    if(!platePt || !releasePt) return null;
+    if(!isFinite(ppm) || ppm<=0) return null;
+    var dx=Number(releasePt.x)-Number(platePt.x), dy=Number(releasePt.y)-Number(platePt.y);
+    if(!isFinite(dx) || !isFinite(dy)) return null;
+    var dist=Math.sqrt(dx*dx+dy*dy);
+    if(!isFinite(dist)) return null;
+    return dist/ppm;
+  }
+
+  // object-fit:contain のレターボックスを考慮し、要素サイズ(dispW×dispH)内で実際に描画される映像矩形を返す純粋関数
+  // 返り値 {x,y,width,height,scale}（要素座標系。scale は実映像px → 表示px の倍率）。無効なら null
+  function letterboxRect(videoW, videoH, dispW, dispH){
+    var vw=Number(videoW), vh=Number(videoH), dw=Number(dispW), dh=Number(dispH);
+    if(!(vw>0) || !(vh>0) || !(dw>0) || !(dh>0)) return null;
+    if(!isFinite(vw) || !isFinite(vh) || !isFinite(dw) || !isFinite(dh)) return null;
+    var s=Math.min(dw/vw, dh/vh);
+    var w=vw*s, h=vh*s;
+    return {x:(dw-w)/2, y:(dh-h)/2, width:w, height:h, scale:s};
+  }
+
+  // クライアント座標(clientX,clientY)を実映像ピクセル座標へ変換する純粋関数（レターボックス補正つき・0..videoW/Hにクランプ）
+  // elRect は video 要素の getBoundingClientRect 相当 {left,top,width,height}。無効なら null
+  function clientToVideoPx(clientX, clientY, elRect, videoW, videoH){
+    if(!elRect) return null;
+    var vw=Number(videoW), vh=Number(videoH);
+    if(!(vw>0) || !(vh>0)) return null;
+    var lb=letterboxRect(vw, vh, Number(elRect.width), Number(elRect.height));
+    if(!lb) return null;
+    var cx=Number(clientX), cy=Number(clientY);
+    if(!isFinite(cx) || !isFinite(cy)) return null;
+    var vx=(cx - Number(elRect.left) - lb.x)/lb.scale;
+    var vy=(cy - Number(elRect.top) - lb.y)/lb.scale;
+    if(!isFinite(vx) || !isFinite(vy)) return null;
+    vx=Math.max(0, Math.min(vw, vx));
+    vy=Math.max(0, Math.min(vh, vy));
+    return {x:vx, y:vy};
+  }
+
+  // 実映像ピクセル座標を要素内の表示位置(%)へ戻す純粋関数（マーカー重ね描画用。レターボックス補正つき）。無効なら null
+  function videoPxToPercent(vx, vy, videoW, videoH, dispW, dispH){
+    var dw=Number(dispW), dh=Number(dispH);
+    var lb=letterboxRect(videoW, videoH, dw, dh);
+    if(!lb || !(dw>0) || !(dh>0)) return null;
+    var px=Number(vx), py=Number(vy);
+    if(!isFinite(px) || !isFinite(py)) return null;
+    return {left:(lb.x + px*lb.scale)/dw*100, top:(lb.y + py*lb.scale)/dh*100};
+  }
+
+  // 音声読み上げテキスト: 表示球速(km/h)を整数に丸めて「○○キロ」。無効値(非数・0以下)なら null
+  function speechTextForKmh(kmh){
+    var v=Number(kmh);
+    if(!isFinite(v) || v<=0) return null;
+    return Math.round(v)+'キロ';
+  }
+
   return {
     SAMPLE_MS:SAMPLE_MS, TRIG_MIN:TRIG_MIN, TRIG_RATIO:TRIG_RATIO, TRIG_STREAK:TRIG_STREAK,
     QUIET_ABS:QUIET_ABS, QUIET_RATIO:QUIET_RATIO, QUIET_MS:QUIET_MS, MAX_REC_MS:MAX_REC_MS, ARM_MS:ARM_MS,
@@ -1261,7 +1482,11 @@ var KYU=(function(){
     stepTimeByFrames:stepTimeByFrames, snapTimeToFrames:snapTimeToFrames, medianFrameDur:medianFrameDur,
     speedKmhByTime:speedKmhByTime,
     soundDelaySec:soundDelaySec, applySoundDelay:applySoundDelay, releaseAdvanceFromHeight:releaseAdvanceFromHeight,
-    initialSpeedFromAvg:initialSpeedFromAvg
+    initialSpeedFromAvg:initialSpeedFromAvg,
+    adaptiveThreshold:adaptiveThreshold, mergeCandidates:mergeCandidates, minIntervalFilter:minIntervalFilter,
+    detectPeaks:detectPeaks, fpsFromFrameTimes:fpsFromFrameTimes, chunkRanges:chunkRanges, segmentPitches:segmentPitches,
+    pxPerMeter:pxPerMeter, releaseAdvanceM:releaseAdvanceM, letterboxRect:letterboxRect,
+    clientToVideoPx:clientToVideoPx, videoPxToPercent:videoPxToPercent, speechTextForKmh:speechTextForKmh
   };
 })();
 if(typeof module!=='undefined' && module.exports){ module.exports=KYU; }
@@ -1304,7 +1529,7 @@ var els={
   listDate:$('listDate'), stats:$('stats'), recordList:$('recordList'), toast:$('toast')
 };
 
-var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null };
+var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null, voiceOn:true, calib:{active:false, points:[], source:null, advanceM:null} };
 var q={ stream:null, starting:false, monitor:null, prev:null, gate:KYU.newGate(),
       mode:'off', mediaRec:null, chunks:[], mime:'', recStartAt:0, blob:null, recId:null, arrivalSource:'', analyzeUrl:null };
 var objectUrl=null;
@@ -1336,7 +1561,7 @@ function loadAll(){ try{ var d=JSON.parse(localStorage.getItem(LS_KEY)); return 
 function saveAll(d){ try{ localStorage.setItem(LS_KEY, JSON.stringify(d)); }catch(e){ toast('保存に失敗しました（容量不足の可能性があります）'); } }
 function loadQuickSettings(){ try{ var d=JSON.parse(localStorage.getItem(QLS_KEY)); return (d&&typeof d==='object')?d:{}; }catch(e){ return {}; } }
 function saveQuickSettings(){
-  try{ localStorage.setItem(QLS_KEY, JSON.stringify({dist:state.distPreset, custom:state.customDist, corr:state.correction, name:els.qPlayerName.value, height:state.heightCm, camDist:state.camDistM})); }catch(e){}
+  try{ localStorage.setItem(QLS_KEY, JSON.stringify({dist:state.distPreset, custom:state.customDist, corr:state.correction, name:els.qPlayerName.value, height:state.heightCm, camDist:state.camDistM, voice:state.voiceOn})); }catch(e){}
 }
 
 function toast(msg){
@@ -1355,7 +1580,7 @@ function syncDistUI(){
   var cw = state.distPreset!=='custom';
   els.qCustomWrap.hidden=cw; els.customWrap.hidden=cw;
   els.qCorr.value=state.correction; els.corr.value=state.correction;
-  var lbl=state.correction.toFixed(1)+'m';
+  var lbl=corrLabel();
   els.qCorrVal.textContent=lbl; els.corrVal.textContent=lbl;
   els.qHeight.value=state.heightCm; els.heightInput.value=state.heightCm;
   els.qCamDist.value=state.camDistM; els.camDistInput.value=state.camDistM;
@@ -1364,21 +1589,28 @@ els.qDistPreset.addEventListener('change', function(){ state.distPreset=els.qDis
 els.distPreset.addEventListener('change', function(){ state.distPreset=els.distPreset.value; syncDistUI(); saveQuickSettings(); updateResult(); });
 els.qCustomDist.addEventListener('input', function(){ state.customDist=els.qCustomDist.value; els.customDist.value=state.customDist; saveQuickSettings(); updateResult(); });
 els.customDist.addEventListener('input', function(){ state.customDist=els.customDist.value; els.qCustomDist.value=state.customDist; saveQuickSettings(); updateResult(); });
-els.qCorr.addEventListener('input', function(){ state.correction=Number(els.qCorr.value); syncDistUI(); saveQuickSettings(); updateResult(); });
-els.corr.addEventListener('input', function(){ state.correction=Number(els.corr.value); syncDistUI(); saveQuickSettings(); updateResult(); });
+els.qCorr.addEventListener('input', function(){ clearCalibSource(); state.correction=Number(els.qCorr.value); syncDistUI(); saveQuickSettings(); updateResult(); });
+els.corr.addEventListener('input', function(){ clearCalibSource(); state.correction=Number(els.corr.value); syncDistUI(); saveQuickSettings(); updateResult(); });
 // リリース補正値をスライダーの step=0.1 に丸めて 0〜3 にクランプする
 function clampCorrection(v){
   if(!isFinite(v)) v=0;
   v=Math.round(v*10)/10;
   return Math.max(0, Math.min(3, v));
 }
+// リリース補正の表示ラベル。タップ校正が反映されている間は出所つきで「校正実測 ○.○○m」、それ以外は通常の「○.○m」
+function corrLabel(){
+  if(state.calib && state.calib.source==='tap') return '校正実測 '+state.correction.toFixed(2)+'m';
+  return state.correction.toFixed(1)+'m';
+}
+// 身長推定や手動スライダーで補正が上書きされたら、タップ校正の出所表示を通常表示に戻す
+function clearCalibSource(){ if(state.calib){ state.calib.source=null; state.calib.advanceM=null; } }
 // 身長入力（クイック/詳細の双方向同期）。有効な身長が入ればリリース補正を「身長m×0.7」に自動設定。空にしても補正値はそのまま維持する
 function onHeightInput(src){
   state.heightCm=src.value;
   var other=(src===els.qHeight)?els.heightInput:els.qHeight;
   other.value=state.heightCm;
   var adv=KYU.releaseAdvanceFromHeight(state.heightCm);
-  if(adv!=null) state.correction=clampCorrection(adv);
+  if(adv!=null){ clearCalibSource(); state.correction=clampCorrection(adv); } // 身長推定で上書きされたら校正の出所表示を戻す
   syncDistUI(); saveQuickSettings(); updateResult();
 }
 els.qHeight.addEventListener('input', function(){ onHeightInput(els.qHeight); });
@@ -1698,6 +1930,7 @@ function qAnalyze(blob){
           // 詳しく測る用に同じ動画を詳細ビューへも読み込む
           loadDetailVideo(blob, 'クイック計測の録画', true);
           updateMarks(); updateResult();
+          speakResult(computeResult()); // クイック計測で結果が確定したら表示球速（初速優先）を音声で読み上げ
           autoSaveQuick(false);
           els.qResultCard.scrollIntoView({behavior:'smooth', block:'start'}); // 計測確定の瞬間に結果パネルを画面の主役にする
           setQStatus('done','計測完了','次の投球を検知すると自動で再計測します。「詳しく測る」で微調整できます');
@@ -1860,6 +2093,8 @@ els.video.addEventListener('loadedmetadata', function(){
   els.video.hidden=false; els.noVideo.hidden=true;
   els.seek.max=totalFrames();
   setControlsEnabled(true);
+  if(batchEls) batchEls.start.disabled=false; // 一括解析の開始ボタンを有効化
+  updateCalibUI(); // タップ校正ボタンの有効/状態を動画読み込みに合わせる
   updateFrameUI(); updateMarks(); updateResult();
 });
 els.video.addEventListener('timeupdate', function(){
@@ -1870,11 +2105,13 @@ els.video.addEventListener('play', function(){ els.playBtn.textContent='一時�
 els.video.addEventListener('pause', function(){ els.playBtn.textContent='再生'; });
 els.video.addEventListener('click', function(){
   if(!state.loaded) return;
+  if(state.calib && state.calib.active) return; // 校正モード中のタップはラッパー側で校正点として処理する
   if(els.video.paused){ els.video.play(); } else { els.video.pause(); }
 });
 
 /* ---- 動画ソース読み込み（ファイル選択 / カメラ録画 / クイック計測からの引き継ぎ） ---- */
 function loadDetailVideo(blob, label, keepMarks){
+  detailBlob=blob; // 一括解析の音声抽出用に元Blobを保持
   if(camStream) stopCamera();
   if(objectUrl) URL.revokeObjectURL(objectUrl);
   objectUrl=URL.createObjectURL(blob);
@@ -1883,6 +2120,7 @@ function loadDetailVideo(blob, label, keepMarks){
   els.fileName.textContent=label+'（'+(blob.size/1048576).toFixed(1)+' MB）';
   state.loaded=false;
   state.frameTimes=null; // MP4でない・取得失敗時は currentTime 方式のまま
+  resetCalibration(); // タップ校正は動画ごとに保持し、新しい動画を読み込んだらリセットする
   if(!keepMarks){ state.releaseTime=null; state.arrivalTime=null; }
   setControlsEnabled(false);
   els.seek.max=0; els.seek.value=0;
@@ -1932,6 +2170,286 @@ function extractMp4FrameTimes(blob){
         finish();
       }catch(e){ resolve(null); }
     }).catch(function(){ resolve(null); });
+  });
+}
+
+/* ---- 一括解析（長い240fps動画の全投球を自動計測。ブルペン動画などが主対象） ----
+   UIはHTMLを編集せずJSで生成し、「1. 動画を読み込む」カードの直後に挿入する。
+   セグメンテーションの純粋ロジックは KYU.segmentPitches / detectPeaks / mergeCandidates 等にあり単体テスト対象。
+   各投球の球速計算は既存 computeResult と同じ computeResultAt 経由（距離プリセット・リリース補正・音速補正も同じ）。 */
+var detailBlob=null;              // 詳細ビューに読み込んだ元Blob（一括解析の音声抽出に使用）
+var batch={ running:false, cancel:false, rows:[], fps:0, savedPos:0 };
+var batchEls=null;
+var BATCH_CHUNK=240;              // 1チャンクあたりの走査フレーム数（チャンクごとにUIへ制御を戻す）
+var scanCanvas=null, scanCtx=null;
+function getScanCtx(){
+  if(!scanCtx){
+    scanCanvas=document.createElement('canvas'); // 走査用キャンバスは使い回す（長時間動画でもキャンバスを増やさない）
+    scanCanvas.width=SCAN_W; scanCanvas.height=SCAN_H;
+    scanCtx=scanCanvas.getContext('2d',{willReadFrequently:true});
+  }
+  return scanCtx;
+}
+function buildBatchUI(){
+  if(batchEls) return;
+  var card=document.createElement('div');
+  card.className='card'; card.id='batchCard';
+  card.innerHTML=
+    '<h2>一括解析（長いスロー動画の全投球を自動計測）</h2>'+
+    '<p class="muted small">読み込んだ動画を全フレーム走査し、捕球音（音声が使えない場合は映像の動き量）から各投球を切り出し、距離プリセット・リリース補正・音速遅延補正つきで球速を一括算出します。ブルペン動画（15〜20球連続など）が主対象です。MP4ならサンプルテーブルから実フレームレートを算出して使います。</p>'+
+    '<div class="mark-row" style="margin-top:8px">'+
+      '<button class="btn btn-primary" id="batchStartBtn" disabled>一括解析を開始</button>'+
+      '<button class="btn btn-accent" id="batchCancelBtn" hidden>キャンセル</button>'+
+    '</div>'+
+    '<progress id="batchBar" max="100" value="0" style="width:100%;margin-top:8px" hidden></progress>'+
+    '<div id="batchProgress" class="muted small" style="margin-top:4px" hidden></div>'+
+    '<p id="batchMsg" class="muted small" style="margin-top:6px"></p>'+
+    '<ul id="batchList" class="records" style="margin-top:8px"></ul>'+
+    '<button class="btn btn-primary" id="batchSaveBtn" disabled style="width:100%;margin-top:8px">選択した投球を保存</button>';
+  var anchor=els.filePanel.closest('.card');
+  (anchor && anchor.parentNode ? anchor.parentNode : els.detailView).insertBefore(card, anchor ? anchor.nextSibling : null);
+  batchEls={
+    card:card, start:$('batchStartBtn'), cancel:$('batchCancelBtn'), bar:$('batchBar'),
+    progress:$('batchProgress'), msg:$('batchMsg'), list:$('batchList'), save:$('batchSaveBtn')
+  };
+  batchEls.start.addEventListener('click', function(){ startBatch(); });
+  batchEls.cancel.addEventListener('click', function(){
+    if(!batch.running) return;
+    batch.cancel=true;
+    batchEls.progress.textContent='キャンセル中…（現在のチャンクの区切りで停止します）';
+  });
+  batchEls.save.addEventListener('click', function(){ saveSelectedBatch(); });
+}
+function setBatchProgress(pct, msg){
+  if(!batchEls) return;
+  batchEls.bar.hidden=false; batchEls.bar.value=pct;
+  batchEls.progress.hidden=false; batchEls.progress.textContent=msg;
+}
+// 動画全体をチャンク分割で走査してフレームごとの動き量列を返す（長時間動画対応。キャンバスは使い回し、チャンク間でsetTimeout yield）
+function scanMotionFull(v, fps, frameTimes, onProgress, shouldCancel){
+  return new Promise(function(res, rej){
+    try{
+      var total=(frameTimes && frameTimes.length) ? frameTimes.length
+        : Math.max(1, Math.round((v.duration||0)*fps));
+      var motion=new Float32Array(total);
+      var x=getScanCtx();
+      var prev=null;
+      var ranges=KYU.chunkRanges(total, BATCH_CHUNK);
+      var ci=0;
+      function runChunk(){
+        if(shouldCancel && shouldCancel()){ res({motion:motion, cancelled:true, done:(ci>0?ranges[ci-1][1]:0)}); return; }
+        if(ci>=ranges.length){ res({motion:motion, cancelled:false, done:total}); return; }
+        var r=ranges[ci++], i=r[0];
+        function stepOne(){
+          if(i>=r[1]){
+            if(onProgress) onProgress(Math.min(1, i/total));
+            setTimeout(runChunk, 0); // チャンクの区切りでUIに制御を戻す
+            return;
+          }
+          if(shouldCancel && shouldCancel()){ res({motion:motion, cancelled:true, done:i}); return; }
+          // MP4のフレーム時刻列があれば正確な時刻へシーク、無ければ i/fps（既存 scanMotion と同じ方式）
+          seekVideo(v, (frameTimes && frameTimes.length) ? frameTimes[i] : i/fps).then(function(){
+            try{ x.drawImage(v,0,0,SCAN_W,SCAN_H); }catch(e){ motion[i]=0; i++; stepOne(); return; }
+            var d=x.getImageData(0,0,SCAN_W,SCAN_H).data;
+            if(prev) motion[i]=KYU.motionMetric(prev,d,SCAN_W,SCAN_H);
+            prev=d;
+            i++; stepOne();
+          }).catch(function(){ i++; stepOne(); });
+        }
+        stepOne();
+      }
+      runChunk();
+    }catch(e){ rej(e); }
+  });
+}
+// 長時間動画の音声から捕球音候補（秒）を複数検出する（5ms窓エンベロープの適応しきい値ピーク＝envelopePeakの長時間拡張。
+// 短い動画(30s以下)では従来どおり webAudioBeatDetector のオンセットも候補に統合する）
+function scanAudioPeaks(blob){
+  return blob.arrayBuffer().then(function(buf){
+    var AC=window.AudioContext||window.webkitAudioContext;
+    if(!AC) return null;
+    var ctx=new AC();
+    return ctx.decodeAudioData(buf.slice(0)).then(function(audio){
+      var sr=audio.sampleRate, c, i, w;
+      var winSec=0.005; // envelopePeak と同じ5ms窓
+      var win=Math.max(1, Math.round(sr*winSec));
+      var nWin=Math.floor(audio.length/win);
+      if(nWin<20){ try{ ctx.close(); }catch(e){} return null; }
+      var chs=[];
+      for(c=0;c<audio.numberOfChannels;c++) chs.push(audio.getChannelData(c));
+      // エンベロープは窓ごとの最大絶対値。チャンネルミックスのコピーは作らず省メモリで全面走査
+      var env=new Float32Array(nWin);
+      for(w=0;w<nWin;w++){
+        var m=0, off=w*win, end=off+win;
+        for(c=0;c<chs.length;c++){ var ch=chs[c]; for(i=off;i<end;i++){ var a=ch[i]<0?-ch[i]:ch[i]; if(a>m) m=a; } }
+        env[w]=m;
+      }
+      var minIntervalWin=Math.max(1, Math.round(2.0/winSec)); // 最小間隔2秒
+      var peaks=KYU.detectPeaks(env, {k:3, minInterval:minIntervalWin, minVal:0.08, smoothWin:3});
+      var cands=peaks.map(function(p){ return {index:p.index, score:p.value, sec:p.index*winSec}; });
+      var bd=KYU.getGlobal('webAudioBeatDetector');
+      var onsetP=(bd && typeof bd.analyze==='function' && audio.duration<=30)
+        ? Promise.resolve().then(function(){ return bd.analyze(audio); })
+            .then(function(r){ return KYU.onsetFromBeatResult(r); })
+            .catch(function(){ return null; })
+        : Promise.resolve(null);
+      return onsetP.then(function(onsetSec){
+        try{ ctx.close(); }catch(e){}
+        if(typeof onsetSec==='number' && isFinite(onsetSec) && onsetSec>0 && onsetSec<=audio.duration){
+          cands.push({index:Math.round(onsetSec/winSec), score:1, sec:onsetSec});
+          cands=KYU.mergeCandidates(cands, minIntervalWin);
+        }
+        cands.sort(function(a,b){ return a.sec-b.sec; });
+        return cands;
+      });
+    }).catch(function(){ try{ ctx.close(); }catch(e){} return null; });
+  }).catch(function(){ return null; });
+}
+// セグメンテーション候補から投球行を生成（球速計算は computeResult と同じ computeResultAt 経由）
+function buildBatchRows(cands, motion){
+  var rows=[];
+  var thr=KYU.adaptiveThreshold(motion||[], {k:2, minVal:0});
+  (cands||[]).forEach(function(c){
+    var hasFT=!!(state.frameTimes && state.frameTimes.length);
+    var rel=hasFT ? KYU.timeOfFrame(state.frameTimes, c.releaseIdx) : c.releaseIdx/batch.fps;
+    var arr=hasFT ? KYU.timeOfFrame(state.frameTimes, c.arrivalIdx) : c.arrivalIdx/batch.fps;
+    if(rel==null || arr==null) return;
+    var r=computeResultAt(rel, arr);
+    if(r.status!=='ok') return;
+    var lowConf = c.confidence!=='high' || (c.motionPeak!=null && c.motionPeak<=thr);
+    rows.push({
+      n:rows.length+1, releaseTime:rel, arrivalTime:arr,
+      releaseIdx:c.releaseIdx, arrivalIdx:c.arrivalIdx,
+      arrivalSource:c.arrivalSource, result:r, checked:true, saved:false,
+      note: lowConf ? '信頼度が低い可能性があります（タップして手動確認を推奨）' : ''
+    });
+  });
+  return rows;
+}
+function renderBatchList(){
+  if(!batchEls) return;
+  batchEls.list.innerHTML='';
+  batch.rows.forEach(function(row){
+    var li=document.createElement('li'); li.className='rec'; li.style.cursor='pointer';
+    var cb=document.createElement('input'); cb.type='checkbox'; cb.checked=row.checked; cb.disabled=row.saved;
+    cb.style.marginRight='8px'; cb.style.transform='scale(1.3)';
+    cb.addEventListener('change', function(){ row.checked=cb.checked; });
+    var info=document.createElement('div');
+    var top=document.createElement('div'); top.className='rec-top';
+    var nm=document.createElement('span'); nm.className='rec-name';
+    nm.textContent='#'+row.n+' ・ '+row.releaseTime.toFixed(3)+'s'+(row.saved?' （保存済み）':'');
+    var km=document.createElement('span'); km.className='rec-kmh';
+    var hero=row.result.kmhInit!=null ? row.result.kmhInit : row.result.kmh;
+    km.textContent=hero.toFixed(1)+' km/h';
+    top.appendChild(nm); top.appendChild(km);
+    var sub=document.createElement('div'); sub.className='rec-sub';
+    sub.textContent='区間平均 '+row.result.kmh.toFixed(1)+' km/h ・ F'+pad(row.releaseIdx,4)+'→F'+pad(row.arrivalIdx,4)+
+      '（'+row.result.frames+'F / '+row.result.timeSec.toFixed(3)+'s） ・ 実効'+row.result.eff.toFixed(2)+'m ・ 到達:'+
+      (row.arrivalSource==='audio'?'捕球音':'動き量')+(row.note?' ・ '+row.note:'');
+    info.appendChild(top); info.appendChild(sub);
+    li.appendChild(cb); li.appendChild(info);
+    li.addEventListener('click', function(e){ if(e.target===cb) return; openBatchRow(row); });
+    batchEls.list.appendChild(li);
+  });
+  if(!batch.rows.length){
+    batchEls.list.innerHTML='<li class="muted small">検出された投球はありません</li>';
+  }
+}
+// 一括結果の行をタップ → その投球位置へシークし、既存の手動修正（±1Fボタン・マーク）ができる状態にする
+function openBatchRow(row){
+  if(!state.loaded) return;
+  state.releaseTime=row.releaseTime;
+  state.arrivalTime=row.arrivalTime;
+  updateMarks(); updateResult();
+  seekToTime(row.releaseTime).then(function(){ els.seek.value=curFrame(); updateFrameUI(); });
+  els.video.scrollIntoView({behavior:'smooth', block:'center'});
+  toast('#'+row.n+' を読み込みました（F'+pad(row.releaseIdx,4)+'）。コマ送りで微調整して保存できます');
+}
+// チェックの付いた投球を既存の記録保存形式（kmh/kmhInit等）で一括保存
+function saveSelectedBatch(){
+  var sel=batch.rows.filter(function(r){ return r.checked && !r.saved; });
+  if(!sel.length){ toast('保存対象の投球がありません'); return; }
+  var all=loadAll();
+  var key=todayKey();
+  if(!all[key]) all[key]=[];
+  sel.forEach(function(row){
+    var rec=makeRecord(row.result, {
+      source:'batch-'+(row.arrivalSource||'unknown'),
+      fps:batch.fps,
+      releaseFrame:row.releaseIdx, arrivalFrame:row.arrivalIdx,
+      videoTime:row.releaseTime
+    });
+    all[key].push(rec);
+    row.saved=true;
+  });
+  saveAll(all);
+  renderRecords(); renderBatchList();
+  toast(sel.length+'件の投球を保存しました（'+dateLabel(key)+'）');
+}
+function startBatch(){
+  if(batch.running) return;
+  if(!state.loaded || !detailBlob){ toast('先に動画を読み込んでください'); return; }
+  batch.running=true; batch.cancel=false; batch.rows=[];
+  batchEls.start.disabled=true; batchEls.cancel.hidden=false; batchEls.save.disabled=true;
+  batchEls.list.innerHTML=''; batchEls.msg.textContent='';
+  batchEls.bar.hidden=false; batchEls.bar.value=0; batchEls.progress.hidden=false;
+  els.video.pause();
+  batch.savedPos=els.video.currentTime;
+  var v=els.video;
+  var audioPeaks=null;
+  setBatchProgress(0, '準備中…（フレーム時刻を確認）');
+  var timesP=(state.frameTimes && state.frameTimes.length)
+    ? Promise.resolve(state.frameTimes)
+    : (looksLikeMp4(detailBlob, els.fileName.textContent) ? extractMp4FrameTimes(detailBlob) : Promise.resolve(null));
+  timesP.then(function(times){
+    if(batch.cancel) throw {cancelled:true};
+    if(times && times.length){ state.frameTimes=times; els.seek.max=totalFrames(); }
+    // 実フレームレート優先（MP4サンプルテーブルから算出できればそれ、無理なら現在のfps設定）
+    batch.fps=KYU.fpsFromFrameTimes(state.frameTimes)||state.fps;
+    setBatchProgress(2, '音声から捕球音候補を検出中…（実効fps '+batch.fps.toFixed(1)+'）');
+    return scanAudioPeaks(detailBlob);
+  }).then(function(pk){
+    if(batch.cancel) throw {cancelled:true};
+    audioPeaks=pk; // null なら後段で動き量のみのフォールバック
+    var peakSecs=(audioPeaks && audioPeaks.length)
+      ? audioPeaks.map(function(p){ return KYU.applySoundDelay(p.sec, state.camDistM); }) // 音速遅延補正
+      : null;
+    setBatchProgress(5, '映像を全フレーム走査中… 0%');
+    return scanMotionFull(v, batch.fps, state.frameTimes, function(pct){
+      if(batch.cancel) return;
+      setBatchProgress(5+Math.round(pct*85), '映像を全フレーム走査中… '+Math.round(pct*100)+'%');
+    }, function(){ return batch.cancel; }).then(function(scan){
+      if(scan.cancelled || batch.cancel) throw {cancelled:true};
+      setBatchProgress(92, '投球イベントを切り出し中…');
+      var cands=KYU.segmentPitches(scan.motion, batch.fps, state.frameTimes, peakSecs, {lookbackSec:1.5, minIntervalSec:2.0});
+      batch.rows=buildBatchRows(cands, scan.motion);
+      return peakSecs;
+    });
+  }).then(function(peakSecs){
+    renderBatchList();
+    setBatchProgress(100, '完了');
+    var n=batch.rows.length;
+    batchEls.msg.textContent=(peakSecs
+      ? '捕球音ベースで '+n+' 球を検出しました（音速補正 -'+Math.round(KYU.soundDelaySec(state.camDistM)*1000)+'ms適用・実効fps '+batch.fps.toFixed(1)+'）'
+      : '音声が使えなかったため映像の動き量のみで '+n+' 球を検出しました（実効fps '+batch.fps.toFixed(1)+'）')
+      +(n ? '。行をタップするとその投球位置へシークして手動修正できます。' : '。投球を検出できませんでした。音声つき・三脚固定の動画でお試しください。');
+    batchEls.save.disabled = n===0;
+  }).catch(function(e){
+    if(e && e.cancelled){
+      setBatchProgress(100, 'キャンセルしました');
+      batchEls.msg.textContent='キャンセルしました。検出結果はありません。';
+    }else{
+      setBatchProgress(100, 'エラー');
+      batchEls.msg.textContent='解析に失敗しました: '+(e && e.message || e);
+      toast('一括解析に失敗しました');
+    }
+  }).then(function(){
+    batch.running=false;
+    batchEls.start.disabled=!state.loaded;
+    batchEls.cancel.hidden=true;
+    // 走査で動かした再生位置を元に戻す（単一計測フローの邪魔をしない）
+    try{ v.currentTime=Math.max(0, Math.min(batch.savedPos, v.duration||batch.savedPos)); }catch(e){}
+    els.seek.value=curFrame(); updateFrameUI();
   });
 }
 
@@ -2176,18 +2694,18 @@ function updateMarks(){
 }
 
 /* ---- 球速計算 ---- */
-function computeResult(){
-  if(state.releaseTime==null || state.arrivalTime==null) return {status:'incomplete'};
+// 指定したリリース/到達時刻で球速を計算する本体（単一計測・一括解析で共通の経路・補正）
+function computeResultAt(releaseTime, arrivalTime){
   var rf, af, frames, timeSec;
   if(state.frameTimes && state.frameTimes.length){
     // MP4コンテナの正確なフレーム時刻列でフレーム番号と経過時間を計算（iOS Safari の currentTime シーク誤差を回避）
-    rf=KYU.frameIndexAt(state.frameTimes, state.releaseTime);
-    af=KYU.frameIndexAt(state.frameTimes, state.arrivalTime);
+    rf=KYU.frameIndexAt(state.frameTimes, releaseTime);
+    af=KYU.frameIndexAt(state.frameTimes, arrivalTime);
     frames=af-rf;
     timeSec=state.frameTimes[af]-state.frameTimes[rf];
   }else{
-    rf=Math.round(state.releaseTime*state.fps);
-    af=Math.round(state.arrivalTime*state.fps);
+    rf=Math.round(releaseTime*state.fps);
+    af=Math.round(arrivalTime*state.fps);
     frames=af-rf;
     timeSec=frames/state.fps;
   }
@@ -2201,6 +2719,10 @@ function computeResult(){
   return {status:'ok', frames:frames, timeSec:timeSec, eff:eff, kmh:kmh,
           accPct:accPct, accKmh:kmh*accPct/100, releaseFrame:rf, arrivalFrame:af,
           kmhInit:KYU.initialSpeedFromAvg(kmh, eff)};
+}
+function computeResult(){
+  if(state.releaseTime==null || state.arrivalTime==null) return {status:'incomplete'};
+  return computeResultAt(state.releaseTime, state.arrivalTime);
 }
 function updateResult(){
   var r=computeResult();
@@ -2219,28 +2741,36 @@ function updateResult(){
 }
 
 /* ---- 保存（localStorage・日付単位・手動ボタンは詳細ビュー用） ---- */
+// 記録オブジェクト生成（保存形式は従来どおり kmh/kmhInit 等。o で source/fps/フレーム番号/動画内時刻を上書き可）
+function makeRecord(r, o){
+  o=o||{};
+  var rec={
+    id:o.id||(Date.now()+'-'+Math.floor(Math.random()*1e6)),
+    at:new Date().toISOString(),
+    name:(o.name!=null)?o.name:(els.playerName.value.trim()||'選手'),
+    kmh:r.kmh, kmhInit:r.kmhInit, accPct:r.accPct, accKmh:r.accKmh, eff:r.eff,
+    dist:selectedDistance(), corr:state.correction, fps:(o.fps||state.fps),
+    frames:r.frames, timeSec:r.timeSec,
+    releaseFrame:(o.releaseFrame!=null)?o.releaseFrame:frameNoOf(state.releaseTime),
+    arrivalFrame:(o.arrivalFrame!=null)?o.arrivalFrame:frameNoOf(state.arrivalTime),
+    source:o.source||'detail'
+  };
+  if(o.videoTime!=null) rec.videoTime=o.videoTime; // 一括解析: 動画内時刻(秒)
+  return rec;
+}
 els.saveBtn.addEventListener('click', function(){
   var r=computeResult();
   if(r.status!=='ok') return;
   var all=loadAll();
   var key=todayKey();
   if(!all[key]) all[key]=[];
-  var rec={
-    id:Date.now()+'-'+Math.floor(Math.random()*1e6),
-    at:new Date().toISOString(),
-    name:els.playerName.value.trim()||'選手',
-    kmh:r.kmh, kmhInit:r.kmhInit, accPct:r.accPct, accKmh:r.accKmh, eff:r.eff,
-    dist:selectedDistance(), corr:state.correction, fps:state.fps,
-    frames:r.frames, timeSec:r.timeSec,
-    releaseFrame:frameNoOf(state.releaseTime),
-    arrivalFrame:frameNoOf(state.arrivalTime),
-    source:'detail'
-  };
+  var rec=makeRecord(r, {source:'detail'});
   all[key].push(rec);
   saveAll(all);
   state.lastSavedId=rec.id; // 結果パネルの「その日」統計で同一記録の二重カウントを防ぐ
   toast('保存しました（'+dateLabel(key)+'）');
   renderRecords();
+  speakResult(r); // 詳細モードで保存したときも表示球速（初速優先）を音声で読み上げ
 });
 
 /* ---- 結果リスト ---- */
@@ -2355,6 +2885,222 @@ els.shareCurrentBtn.addEventListener('click', function(){
   });
 });
 
+/* ---- 球速の音声読み上げ（speechSynthesis・ja-JP） ----
+   設定のON/OFFトグル（既定ON・localStorageの設定永続化に含む）。speechSynthesis が無い環境では何もしない。
+   連続計測時は前の読み上げをキャンセルしてから次を読む。 */
+var voiceToggles=[];
+function speakKmh(kmh){
+  if(!state.voiceOn) return;
+  var synth=(typeof window!=='undefined' && window) ? window.speechSynthesis : (typeof speechSynthesis!=='undefined' ? speechSynthesis : null);
+  if(!synth || typeof synth.speak!=='function') return; // speechSynthesis が無い環境では何もしない
+  var text=KYU.speechTextForKmh(kmh);
+  if(!text) return;
+  try{ synth.cancel(); }catch(e){} // 連続計測時は前の読み上げをキャンセルしてから次を読む
+  var U=(typeof window!=='undefined' && window && window.SpeechSynthesisUtterance) ? window.SpeechSynthesisUtterance
+      : (typeof SpeechSynthesisUtterance!=='undefined' ? SpeechSynthesisUtterance : null);
+  var u=U ? new U(text) : {text:text};
+  u.lang='ja-JP';
+  try{ synth.speak(u); }catch(e){}
+}
+// 結果オブジェクトから表示球速（初速優先）を取り出して読み上げる。ok 以外は読まない
+function speakResult(r){
+  if(!r || r.status!=='ok') return;
+  speakKmh(r.kmhInit!=null ? r.kmhInit : r.kmh);
+}
+// ON/OFFトグルを既存の設定エリア（クイック/詳細のカメラ〜ミット距離入力の直後）へJSで挿入
+function makeVoiceToggle(anchor){
+  var row=document.createElement('div');
+  row.className='row-label';
+  var label=document.createElement('label');
+  label.style.cursor='pointer';
+  var cb=document.createElement('input');
+  cb.type='checkbox'; cb.checked=state.voiceOn;
+  cb.style.marginRight='6px';
+  cb.addEventListener('change', function(){
+    state.voiceOn=cb.checked;
+    voiceToggles.forEach(function(t){ t.cb.checked=state.voiceOn; }); // 両ビューのトグルを同期
+    saveQuickSettings();
+  });
+  label.appendChild(cb);
+  label.appendChild(document.createTextNode('球速を音声で読み上げる（ON/OFF）'));
+  row.appendChild(label);
+  if(anchor && anchor.parentNode) anchor.parentNode.insertBefore(row, anchor.nextSibling);
+  return {row:row, cb:cb};
+}
+function buildVoiceToggles(){
+  if(voiceToggles.length) return;
+  voiceToggles.push(makeVoiceToggle(els.qCamDist));
+  voiceToggles.push(makeVoiceToggle(els.camDistInput));
+}
+
+/* ---- 2点タップ校正（詳細モード・JS生成UI。HTMLは無変更） ----
+  ねらい: リリース補正（前進距離）を身長×0.7の仮定ではなく映像からの実測値にする。
+   手順: ①投球プレート ②ホームベース（①②の実世界距離=現在の距離プリセット）③リリース位置（現在の再生フレームに対してタップ）。
+   校正結果: リリース前進距離[m] = ③と①のピクセル距離 ÷ pxPerMeter(①,②,プリセット距離) を state.correction に反映（既存clamp 0〜3m適用）。
+   タップ座標は video 要素のレターボックス(object-fit)を考慮して実映像座標へ変換する。
+   注意: カメラ〜ミット距離（音速補正用）は画面内の2点からは原理的に出ないため校正対象に含めない（手入力のまま）。 */
+var calibEls=null, videoWrap=null, calibOverlay=null;
+var CALIB_STEPS=['投球プレートの位置','ホームベースの位置','リリース位置（ボールを離した瞬間の手の位置）'];
+var CALIB_LABELS=['投','ベ','リ'];
+// 動画をラッパーで囲み、絶対配置のマーカーオーバーレイを載せる（HTMLファイルは変更しない）
+function ensureVideoWrap(){
+  if(videoWrap) return videoWrap;
+  var v=els.video;
+  videoWrap=document.createElement('div');
+  videoWrap.id='calibVideoWrap';
+  videoWrap.style.position='relative';
+  videoWrap.style.width='100%';
+  if(v.parentNode){ v.parentNode.insertBefore(videoWrap, v); }
+  else{ els.detailView.appendChild(videoWrap); }
+  videoWrap.appendChild(v);
+  calibOverlay=document.createElement('div');
+  calibOverlay.id='calibOverlay';
+  calibOverlay.style.position='absolute';
+  calibOverlay.style.left='0'; calibOverlay.style.top='0';
+  calibOverlay.style.right='0'; calibOverlay.style.bottom='0';
+  calibOverlay.style.pointerEvents='none'; // 動画の再生/一時停止タップを邪魔しない
+  videoWrap.appendChild(calibOverlay);
+  // 校正モード中のタップはここで受け、レターボックス補正つきで実映像座標に変換して点を打つ
+  videoWrap.addEventListener('click', function(e){
+    var c=state.calib;
+    if(!c || !c.active || !state.loaded) return;
+    var el=v;
+    if(!(el.videoWidth>0) || !(el.videoHeight>0)) return;
+    var r=el.getBoundingClientRect();
+    var pt=KYU.clientToVideoPx(e.clientX, e.clientY, {left:r.left, top:r.top, width:r.width, height:r.height}, el.videoWidth, el.videoHeight);
+    if(!pt) return;
+    addCalibPoint(pt);
+  });
+  return videoWrap;
+}
+function buildCalibUI(){
+  if(calibEls) return;
+  ensureVideoWrap();
+  var card=document.createElement('div');
+  card.className='card'; card.id='calibCard';
+  card.innerHTML=
+    '<h2>タップ校正（2点タップでリリース補正を実測）</h2>'+
+    '<p class="muted small">身長×0.7の仮定の代わりに、映像上の2点（投球プレート〜ホームベース）の実世界距離（現在の距離プリセット）から1mあたりのピクセル数を求め、リリース位置との距離でリリース前進距離を実測します。手順: ①投球プレート ②ホームベース ③リリース位置（リリースフレームにコマ送りして、そのフレーム上でタップ）。</p>'+
+    '<p class="muted small">※カメラ〜ミット距離（捕球音の音速補正用）は画面内の2点からは原理的に求まらないため、この校正の対象外です（手入力のまま）。</p>'+
+    '<div class="mark-row" style="margin-top:8px">'+
+      '<button class="btn btn-primary" id="calibStartBtn" disabled>タップ校正を開始</button>'+
+      '<button class="btn btn-accent" id="calibCancelBtn" hidden>キャンセル</button>'+
+    '</div>'+
+    '<div class="mark-row" style="margin-top:6px">'+
+      '<button class="btn btn-accent2" id="calibRedoBtn" hidden>やり直し（3点を打ち直す）</button>'+
+      '<div></div>'+
+    '</div>'+
+    '<p id="calibStatus" class="muted small" style="margin-top:6px"></p>'+
+    '<p id="calibResult" class="small" style="margin-top:2px;font-weight:700"></p>';
+  var anchor=els.video.closest('.card'); // 「2. コマ送り」カードの直後に挿入
+  (anchor && anchor.parentNode ? anchor.parentNode : els.detailView).insertBefore(card, anchor ? anchor.nextSibling : null);
+  calibEls={
+    card:card, start:$('calibStartBtn'), cancel:$('calibCancelBtn'), redo:$('calibRedoBtn'),
+    status:$('calibStatus'), result:$('calibResult')
+  };
+  calibEls.start.addEventListener('click', function(){ startCalibration(); });
+  calibEls.redo.addEventListener('click', function(){ redoCalibration(); });
+  calibEls.cancel.addEventListener('click', function(){ cancelCalibration(); });
+  window.addEventListener('resize', function(){ renderCalibMarkers(); });
+  updateCalibUI();
+}
+function startCalibration(){
+  if(!state.loaded){ toast('先に動画を読み込んでください'); return; }
+  if(!(els.video.videoWidth>0)){ toast('動画の読み込みが完了してから開始してください'); return; }
+  els.video.pause();
+  state.calib.active=true; state.calib.points=[];
+  calibEls.start.hidden=true; calibEls.redo.hidden=false; calibEls.cancel.hidden=false;
+  renderCalibMarkers(); updateCalibUI();
+}
+function redoCalibration(){
+  state.calib.active=true; state.calib.points=[]; state.calib.source=null; state.calib.advanceM=null;
+  calibEls.start.hidden=true; calibEls.redo.hidden=false; calibEls.cancel.hidden=false;
+  renderCalibMarkers(); updateCalibUI();
+}
+function cancelCalibration(){
+  state.calib.active=false; state.calib.points=[]; // 反映済みの補正値（source='tap' なら維持）はそのまま残す
+  calibEls.start.hidden=false; calibEls.redo.hidden=true; calibEls.cancel.hidden=true;
+  renderCalibMarkers(); updateCalibUI();
+}
+function resetCalibration(){ // 動画を読み替えたら校正をリセット
+  state.calib={active:false, points:[], source:null, advanceM:null};
+  if(calibEls){ calibEls.start.hidden=false; calibEls.redo.hidden=true; calibEls.cancel.hidden=true; }
+  renderCalibMarkers(); updateCalibUI();
+}
+function addCalibPoint(pt){
+  var c=state.calib;
+  if(!c || !c.active || c.points.length>=3) return;
+  c.points.push(pt);
+  renderCalibMarkers();
+  if(c.points.length>=3) finishCalibration();
+  else updateCalibUI();
+}
+function finishCalibration(){
+  var c=state.calib;
+  var d=selectedDistance();
+  var ppm=(d!=null && d>0) ? KYU.pxPerMeter(c.points[0], c.points[1], d) : null;
+  var adv=(ppm!=null) ? KYU.releaseAdvanceM(c.points[0], c.points[2], ppm) : null;
+  if(ppm==null || adv==null){
+    c.active=false; c.points=[];
+    calibEls.start.hidden=false; calibEls.redo.hidden=true; calibEls.cancel.hidden=true;
+    renderCalibMarkers(); updateCalibUI();
+    toast('2点がほぼ同じ位置のため校正できませんでした。やり直してください');
+    return;
+  }
+  c.source='tap'; c.advanceM=adv;
+  state.correction=clampCorrection(adv); // 既存の clamp（0〜3m・step 0.1）を適用して反映
+  c.active=false;
+  calibEls.start.hidden=false; calibEls.redo.hidden=true; calibEls.cancel.hidden=true;
+  syncDistUI(); saveQuickSettings(); updateResult(); // ラベルは「校正実測 ○.○○m」に変わる
+  renderCalibMarkers(); updateCalibUI();
+  toast('校正実測 '+state.correction.toFixed(2)+'m をリリース補正に反映しました');
+}
+function updateCalibUI(){
+  if(!calibEls) return;
+  var c=state.calib||{active:false, points:[], source:null};
+  var n=c.points ? c.points.length : 0;
+  calibEls.start.disabled=!state.loaded;
+  if(c.active){
+    calibEls.status.textContent = n<3
+      ? '校正モード中: ('+(n+1)+'/3) '+CALIB_STEPS[n]+' を動画上でタップしてください（現在の再生フレームに対して打ちます）'
+      : '計算中…';
+  }else{
+    calibEls.status.textContent = c.source==='tap'
+      ? '校正済みです（この動画限定）。やり直す場合は「タップ校正を開始」を押してください'
+      : '未校正です。「タップ校正を開始」を押し、動画上の3点をタップしてください';
+  }
+  calibEls.result.textContent = (c.source==='tap')
+    ? '校正実測 '+state.correction.toFixed(2)+'m（2点タップ校正: プレート〜ホームベース間を距離プリセット換算）'
+    : '';
+}
+// 校正点マーカーを動画上に絶対配置で重ねる（実映像座標→表示%へレターボックス補正して配置）
+function renderCalibMarkers(){
+  if(!calibOverlay) return;
+  calibOverlay.innerHTML='';
+  var pts=(state.calib && state.calib.points) || [];
+  var v=els.video;
+  if(!(v.videoWidth>0) || !(v.videoHeight>0) || !pts.length) return;
+  var rect=v.getBoundingClientRect();
+  pts.forEach(function(pt, i){
+    var pos=KYU.videoPxToPercent(pt.x, pt.y, v.videoWidth, v.videoHeight, rect.width, rect.height);
+    if(!pos) return;
+    var dot=document.createElement('div');
+    dot.className='calib-dot';
+    dot.style.position='absolute';
+    dot.style.left=pos.left+'%'; dot.style.top=pos.top+'%';
+    dot.style.width='20px'; dot.style.height='20px';
+    dot.style.margin='-10px 0 0 -10px';
+    dot.style.borderRadius='50%';
+    dot.style.background='rgba(255,213,79,0.95)';
+    dot.style.border='2px solid #d23b3b';
+    dot.style.pointerEvents='none';
+    dot.style.display='flex'; dot.style.alignItems='center'; dot.style.justifyContent='center';
+    dot.style.fontSize='10px'; dot.style.fontWeight='700'; dot.style.color='#3a1010';
+    dot.textContent=CALIB_LABELS[i]||String(i+1);
+    calibOverlay.appendChild(dot);
+  });
+}
+
 /* ---- 初期化 ---- */
 (function init(){
   var qs=loadQuickSettings();
@@ -2366,12 +3112,40 @@ els.shareCurrentBtn.addEventListener('click', function(){
   if(typeof qs.height==='number' && isFinite(qs.height) && qs.height>0) state.heightCm=String(qs.height);
   else if(typeof qs.height==='string' && qs.height!=='') state.heightCm=qs.height;
   if(typeof qs.camDist==='number' && isFinite(qs.camDist) && qs.camDist>=0) state.camDistM=qs.camDist;
+  if(typeof qs.voice==='boolean') state.voiceOn=qs.voice; // 音声読み上げON/OFF（既定ON）
   syncDistUI();
   setControlsEnabled(false);
   updateFrameUI(); updateMarks(); updateResult();
   renderRecords();
+  buildBatchUI(); // 一括解析カードを「1. 動画を読み込む」の直後へJSで挿入
+  buildCalibUI(); // タップ校正カードを「2. コマ送り」カードの直後へJSで挿入
+  buildVoiceToggles(); // 音声読み上げトグルをクイック/詳細の設定へJSで挿入
   setView('quick'); // 初期画面はクイック計測。カメラを自動起動
 })();
+/* Node単体テスト用フック（ブラウザでは module 未定義のため無効。module.exports は KYU のまま変えない） */
+if(typeof module!=='undefined' && module.exports){
+  KYU.__test={
+    els:els, state:state, batch:batch,
+    setDetailBlob:function(b){ detailBlob=b; },
+    computeResult:computeResult, computeResultAt:computeResultAt,
+    makeRecord:makeRecord, loadAll:loadAll, saveAll:saveAll,
+    buildBatchUI:buildBatchUI, startBatch:startBatch,
+    buildBatchRows:buildBatchRows, renderBatchList:renderBatchList,
+    openBatchRow:openBatchRow, saveSelectedBatch:saveSelectedBatch,
+    scanMotionFull:scanMotionFull, scanAudioPeaks:scanAudioPeaks,
+    setBatchProgress:setBatchProgress, todayKey:todayKey, pad:pad,
+    speakKmh:speakKmh, speakResult:speakResult, buildVoiceToggles:buildVoiceToggles, voiceToggles:voiceToggles,
+    buildCalibUI:buildCalibUI, ensureVideoWrap:ensureVideoWrap,
+    startCalibration:startCalibration, cancelCalibration:cancelCalibration, redoCalibration:redoCalibration,
+    addCalibPoint:addCalibPoint, finishCalibration:finishCalibration, resetCalibration:resetCalibration,
+    updateCalibUI:updateCalibUI, renderCalibMarkers:renderCalibMarkers,
+    calibEls:function(){ return calibEls; }, videoWrap:function(){ return videoWrap; }, calibOverlay:function(){ return calibOverlay; },
+    corrLabel:corrLabel, clampCorrection:clampCorrection, clearCalibSource:clearCalibSource,
+    syncDistUI:syncDistUI, loadDetailVideo:loadDetailVideo, selectedDistance:selectedDistance, effectiveDistance:effectiveDistance,
+    saveQuickSettings:saveQuickSettings, loadQuickSettings:loadQuickSettings,
+    onHeightInput:onHeightInput, setView:setView, updateResult:updateResult
+  };
+}
 })();
 </script>
 </body>
