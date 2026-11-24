@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.5 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.6 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -1230,6 +1230,20 @@ var KYU=(function(){
     if(!isFinite(h) || h<=0) return null;
     return Math.round((h/100)*0.7*100 + 1e-9)/100;
   }
+
+  // 初速換算: 2次抵抗モデル dv/dt = -k v^2（k = ρ・Cd・A / (2m)）において、
+  // 距離 D を進む間の区間平均速度 v_avg から初速 v0 を推定する
+  //   v0 = v_avg × (e^{kD} − 1) / (kD)
+  // 定数: ρ=1.225 kg/m^3, Cd=0.40, ボール質量 m=0.145 kg, ボール直径 d=0.074 m → k≈0.00727 /m
+  // avgKmh<=0・distM<=0・非有限値なら null。それ以外は km/h のまま v0 を返す
+  var RHO=1.225, CD=0.40, BALL_M=0.145, BALL_D=0.074;
+  var K_DRAG=RHO*CD*(Math.PI*Math.pow(BALL_D/2,2))/(2*BALL_M); // ≈0.00727 /m
+  function initialSpeedFromAvg(avgKmh, distM){
+    var v=Number(avgKmh), d=Number(distM);
+    if(!isFinite(v) || !isFinite(d) || v<=0 || d<=0) return null;
+    var kD=K_DRAG*d;
+    return v*(Math.exp(kD)-1)/kD;
+  }
   // 球速計算: effM ÷ (frames/fps) 秒 → km/h
   function speedKmh(effM,frames,fps){
     if(!(frames>0) || !(fps>0)) return 0;
@@ -1246,13 +1260,12 @@ var KYU=(function(){
     frameTimesFromSamples:frameTimesFromSamples, frameIndexAt:frameIndexAt, timeOfFrame:timeOfFrame,
     stepTimeByFrames:stepTimeByFrames, snapTimeToFrames:snapTimeToFrames, medianFrameDur:medianFrameDur,
     speedKmhByTime:speedKmhByTime,
-    soundDelaySec:soundDelaySec, applySoundDelay:applySoundDelay, releaseAdvanceFromHeight:releaseAdvanceFromHeight
+    soundDelaySec:soundDelaySec, applySoundDelay:applySoundDelay, releaseAdvanceFromHeight:releaseAdvanceFromHeight,
+    initialSpeedFromAvg:initialSpeedFromAvg
   };
 })();
 if(typeof module!=='undefined' && module.exports){ module.exports=KYU; }
 /* ==KYU-PURE-END== */
-
-
 </script>
 
 <script>
@@ -1703,11 +1716,13 @@ function markText(t){
 }
 /* ---- 結果パネル（TrackMan風ダッシュボード） 共通描画 ---- */
 var lastResultStatus='init';
+// 記録の表示球速（推定初速優先。旧記録は kmhInit が無いので区間平均 kmh にフォールバック）
+function dispKmh(rec){ return rec.kmhInit!=null ? rec.kmhInit : rec.kmh; }
 // その日の統計（保存済み記録から現在の計測を除外してから現在値を加える＝二重カウント防止）
 function dayStats(excludeId, includeKmh){
   var key=todayKey();
   var list=(loadAll()[key]||[]).filter(function(x){ return x.id!==excludeId; });
-  var vals=list.map(function(x){ return x.kmh; });
+  var vals=list.map(function(x){ return dispKmh(x); });
   if(typeof includeKmh==='number' && isFinite(includeKmh)) vals.push(includeKmh);
   if(!vals.length) return {max:null, avg:null, count:0};
   var max=vals[0], sum=0;
@@ -1719,15 +1734,15 @@ function tile(label, val, sub, accent){
     '<div class="t-val'+(accent?' t-acc':'')+'">'+val+'</div>'+
     (sub?'<div class="t-sub">'+sub+'</div>':'')+'</div>';
 }
-// 球速（特大ヒーロー）＋副次指標タイルのグリッドを組み立てる
+// 球速（特大ヒーロー＝推定初速）＋副次指標タイルのグリッドを組み立てる
 function resultPanelHTML(r, excludeId){
-  var st=dayStats(excludeId, r.kmh);
-  var now=new Date();
+  var heroKmh = r.kmhInit!=null ? r.kmhInit : r.kmh; // ヒーロー表示球速（推定初速優先）
+  var st=dayStats(excludeId, heroKmh);
   var ms=Math.round(r.timeSec*1000);
   return '<div class="rpanel">'+
-    '<div class="hero-tile"><div class="hero-val">'+r.kmh.toFixed(1)+'</div><div class="hero-unit">km/h</div></div>'+
+    '<div class="hero-tile"><div class="t-label">推定初速</div><div class="hero-val">'+heroKmh.toFixed(1)+'</div><div class="hero-unit">km/h</div></div>'+
     '<div class="tiles">'+
-      tile('推定精度', '±'+r.accPct.toFixed(1)+'%', '±'+r.accKmh.toFixed(1)+' km/h')+
+      tile('推定精度', '±'+r.accPct.toFixed(1)+'%', '±'+(heroKmh*r.accPct/100).toFixed(1)+' km/h')+
       tile('経過フレーム', r.frames+' F', 'F'+pad(r.releaseFrame,4)+' → F'+pad(r.arrivalFrame,4))+
       tile('経過時間', ms+' ms', r.timeSec.toFixed(3)+' s')+
       tile('実効距離', r.eff.toFixed(2)+' m', selectedDistance().toFixed(2)+'−'+state.correction.toFixed(1)+'m')+
@@ -1735,7 +1750,7 @@ function resultPanelHTML(r, excludeId){
       tile('本日 MAX', st.max==null?'-':st.max.toFixed(1), 'km/h', true)+
       tile('本日 平均', st.avg==null?'-':st.avg.toFixed(1), 'km/h')+
       tile('球数', String(st.count), '本日')+
-      tile('計測時刻', pad(now.getHours(),2)+':'+pad(now.getMinutes(),2)+':'+pad(now.getSeconds(),2))+
+      tile('区間平均', r.kmh.toFixed(1), '実測・リリース→ミット')+
     '</div></div>';
 }
 function renderQuickResult(){
@@ -1790,7 +1805,7 @@ function buildRec(){
     id: q.recId || (Date.now()+'-'+Math.floor(Math.random()*1e6)),
     at:new Date().toISOString(),
     name:els.qPlayerName.value.trim()||'選手',
-    kmh:r.kmh, accPct:r.accPct, accKmh:r.accKmh, eff:r.eff,
+    kmh:r.kmh, kmhInit:r.kmhInit, accPct:r.accPct, accKmh:r.accKmh, eff:r.eff,
     dist:selectedDistance(), corr:state.correction, fps:state.fps,
     frames:r.frames, timeSec:r.timeSec,
     releaseFrame:frameNoOf(state.releaseTime),
@@ -2184,7 +2199,8 @@ function computeResult(){
   var fd=KYU.medianFrameDur(state.frameTimes) || frameDur();
   var accPct=(fd/timeSec)*100;
   return {status:'ok', frames:frames, timeSec:timeSec, eff:eff, kmh:kmh,
-          accPct:accPct, accKmh:kmh*accPct/100, releaseFrame:rf, arrivalFrame:af};
+          accPct:accPct, accKmh:kmh*accPct/100, releaseFrame:rf, arrivalFrame:af,
+          kmhInit:KYU.initialSpeedFromAvg(kmh, eff)};
 }
 function updateResult(){
   var r=computeResult();
@@ -2213,7 +2229,7 @@ els.saveBtn.addEventListener('click', function(){
     id:Date.now()+'-'+Math.floor(Math.random()*1e6),
     at:new Date().toISOString(),
     name:els.playerName.value.trim()||'選手',
-    kmh:r.kmh, accPct:r.accPct, accKmh:r.accKmh, eff:r.eff,
+    kmh:r.kmh, kmhInit:r.kmhInit, accPct:r.accPct, accKmh:r.accKmh, eff:r.eff,
     dist:selectedDistance(), corr:state.correction, fps:state.fps,
     frames:r.frames, timeSec:r.timeSec,
     releaseFrame:frameNoOf(state.releaseTime),
@@ -2239,17 +2255,17 @@ function renderRecords(){
     return;
   }
   var max=-1, sum=0;
-  list.forEach(function(r){ if(r.kmh>max) max=r.kmh; sum+=r.kmh; });
+  list.forEach(function(r){ var v=dispKmh(r); if(v>max) max=v; sum+=v; });
   els.stats.innerHTML=dateLabel(key)+' ： 球数 <b>'+list.length+'</b> ／ MAX <b class="hl">'+max.toFixed(1)+
     ' km/h</b> ／ 平均 <b>'+(sum/list.length).toFixed(1)+' km/h</b>';
   els.recordList.innerHTML='';
-  list.slice().sort(function(a,b){ return b.kmh-a.kmh; }).forEach(function(r){
+  list.slice().sort(function(a,b){ return dispKmh(b)-dispKmh(a); }).forEach(function(r){
     var li=document.createElement('li'); li.className='rec';
     var d=new Date(r.at);
     var info=document.createElement('div');
     var top=document.createElement('div'); top.className='rec-top';
     var nm=document.createElement('span'); nm.className='rec-name'; nm.textContent=r.name;
-    var km=document.createElement('span'); km.className='rec-kmh'; km.textContent=r.kmh.toFixed(1)+' km/h';
+    var km=document.createElement('span'); km.className='rec-kmh'; km.textContent=dispKmh(r).toFixed(1)+' km/h';
     top.appendChild(nm); top.appendChild(km);
     var sub=document.createElement('div'); sub.className='rec-sub';
     sub.textContent=pad(d.getHours(),2)+':'+pad(d.getMinutes(),2)+':'+pad(d.getSeconds(),2)+
@@ -2303,8 +2319,10 @@ function downloadShareImage(rec){
     stitch(x, cx-205, cy, 245, Math.PI*(0.82+i*0.075));
     stitch(x, cx+205, cy, 245, Math.PI*(1.82+i*0.075));
   }
+  x.fillStyle='#9aa7c7'; x.font='500 32px '+FONT;
+  x.fillText('推定初速',540,508);
   x.fillStyle='#ffffff'; x.font='900 250px '+FONT;
-  x.fillText(rec.kmh.toFixed(1),540,700);
+  x.fillText(dispKmh(rec).toFixed(1),540,700);
   x.fillStyle='#ffd54f'; x.font='900 96px '+FONT;
   x.fillText('km/h',540,800);
   x.fillStyle='#ffffff'; x.font='700 66px '+FONT;
@@ -2333,7 +2351,7 @@ els.shareCurrentBtn.addEventListener('click', function(){
   downloadShareImage({
     at:new Date().toISOString(),
     name:els.playerName.value.trim()||'選手',
-    kmh:r.kmh, accPct:r.accPct, accKmh:r.accKmh, eff:r.eff, fps:state.fps
+    kmh:r.kmh, kmhInit:r.kmhInit, accPct:r.accPct, accKmh:r.accKmh, eff:r.eff, fps:state.fps
   });
 });
 
