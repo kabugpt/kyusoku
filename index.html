@@ -177,6 +177,10 @@ footer{margin-top:20px;}
       </div>
       <div class="row-label">リリース補正（手前で離れる分・前回値を復元） <span id="qCorrVal">1.2m</span></div>
       <input type="range" id="qCorr" min="0" max="3" step="0.1" value="1.2">
+      <div class="row-label">選手の身長（cm・入力するとリリース補正を身長×0.7で自動設定）</div>
+      <input type="number" id="qHeight" min="100" max="220" step="1" placeholder="身長（例：150）">
+      <div class="row-label">カメラからミットまでの距離（m・捕球音の到達遅延を補正）</div>
+      <input type="number" id="qCamDist" min="0" max="40" step="0.5" value="10" placeholder="距離（例：10）">
       <details class="guide">
         <summary>撮影ガイドを見る</summary>
         <ul>
@@ -318,6 +322,10 @@ footer{margin-top:20px;}
       </div>
       <div class="row-label">リリース補正（手前で離れる分） <span id="corrVal">1.2m</span></div>
       <input type="range" id="corr" min="0" max="3" step="0.1" value="1.2">
+      <div class="row-label">選手の身長（cm・入力するとリリース補正を身長×0.7で自動設定）</div>
+      <input type="number" id="heightInput" min="100" max="220" step="1" placeholder="身長（例：150）">
+      <div class="row-label">カメラからミットまでの距離（m・捕球音の到達遅延を補正）</div>
+      <input type="number" id="camDistInput" min="0" max="40" step="0.5" value="10" placeholder="距離（例：10）">
       <div id="result" class="result">
         <div class="muted small">リリース点と到達点を設定すると球速が表示されます</div>
       </div>
@@ -338,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.4.1 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.5 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -1048,6 +1056,19 @@ var KYU=(function(){
     return {ok:false, peakSec:0, source:'none'};
   }
 
+  // 音速遅延(秒): カメラ〜ミット距離 distM[m] に対して distM/343（音速 343m/s）。無効値・負値は 0
+  function soundDelaySec(distM){
+    var d=Number(distM);
+    if(!isFinite(d) || d<0) return 0;
+    return d/343;
+  }
+
+  // 音声ピーク時刻(秒)へ音速遅延補正を適用する純粋関数。遅延秒を差し引き、0未満にはクランプする
+  function applySoundDelay(peakSec, distM){
+    if(typeof peakSec!=='number' || !isFinite(peakSec)) return peakSec;
+    return Math.max(0, peakSec - soundDelaySec(distM));
+  }
+
   // mp4box のサンプル配列からフレーム表示時刻(秒)の列を作る（cts優先、無ければdts ÷ timescale）。単調でなければ null
   function frameTimesFromSamples(samples, timescale){
     if(!samples || !samples.length || !(timescale>0) || !isFinite(timescale)) return null;
@@ -1202,6 +1223,13 @@ var KYU=(function(){
     if(!(timeSec>0) || !(effM>0)) return 0;
     return effM/timeSec*3.6;
   }
+
+  // 身長(cm)からリリース補正量(m)を推定: 身長m×0.7 を小数2桁(cm精度・四捨五入)に丸める。無効値(非数・0以下)なら null
+  function releaseAdvanceFromHeight(heightCm){
+    var h=Number(heightCm);
+    if(!isFinite(h) || h<=0) return null;
+    return Math.round((h/100)*0.7*100 + 1e-9)/100;
+  }
   // 球速計算: effM ÷ (frames/fps) 秒 → km/h
   function speedKmh(effM,frames,fps){
     if(!(frames>0) || !(fps>0)) return 0;
@@ -1217,11 +1245,13 @@ var KYU=(function(){
     onsetFromBeatResult:onsetFromBeatResult, pickAudioPeak:pickAudioPeak,
     frameTimesFromSamples:frameTimesFromSamples, frameIndexAt:frameIndexAt, timeOfFrame:timeOfFrame,
     stepTimeByFrames:stepTimeByFrames, snapTimeToFrames:snapTimeToFrames, medianFrameDur:medianFrameDur,
-    speedKmhByTime:speedKmhByTime
+    speedKmhByTime:speedKmhByTime,
+    soundDelaySec:soundDelaySec, applySoundDelay:applySoundDelay, releaseAdvanceFromHeight:releaseAdvanceFromHeight
   };
 })();
 if(typeof module!=='undefined' && module.exports){ module.exports=KYU; }
 /* ==KYU-PURE-END== */
+
 
 </script>
 
@@ -1241,6 +1271,7 @@ var els={
   qCamMsg:$('qCamMsg'), qCamInfo:$('qCamInfo'), qRetryCam:$('qRetryCam'), qToFile:$('qToFile'),
   qDistPreset:$('qDistPreset'), qCustomWrap:$('qCustomWrap'), qCustomDist:$('qCustomDist'),
   qCorr:$('qCorr'), qCorrVal:$('qCorrVal'),
+  qHeight:$('qHeight'), qCamDist:$('qCamDist'),
   qResultCard:$('qResultCard'), qResult:$('qResult'),
   qRelMinus:$('qRelMinus'), qRelPlus:$('qRelPlus'), qArrMinus:$('qArrMinus'), qArrPlus:$('qArrPlus'),
   qRelInfo:$('qRelInfo'), qArrInfo:$('qArrInfo'), qArrSource:$('qArrSource'),
@@ -1255,12 +1286,12 @@ var els={
   markRelease:$('markRelease'), markArrival:$('markArrival'),
   releaseInfo:$('releaseInfo'), arrivalInfo:$('arrivalInfo'),
   distPreset:$('distPreset'), customWrap:$('customWrap'), customDist:$('customDist'),
-  corr:$('corr'), corrVal:$('corrVal'), result:$('result'),
+  corr:$('corr'), corrVal:$('corrVal'), heightInput:$('heightInput'), camDistInput:$('camDistInput'), result:$('result'),
   playerName:$('playerName'), saveBtn:$('saveBtn'), shareCurrentBtn:$('shareCurrentBtn'),
   listDate:$('listDate'), stats:$('stats'), recordList:$('recordList'), toast:$('toast')
 };
 
-var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null };
+var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null };
 var q={ stream:null, starting:false, monitor:null, prev:null, gate:KYU.newGate(),
       mode:'off', mediaRec:null, chunks:[], mime:'', recStartAt:0, blob:null, recId:null, arrivalSource:'', analyzeUrl:null };
 var objectUrl=null;
@@ -1292,7 +1323,7 @@ function loadAll(){ try{ var d=JSON.parse(localStorage.getItem(LS_KEY)); return 
 function saveAll(d){ try{ localStorage.setItem(LS_KEY, JSON.stringify(d)); }catch(e){ toast('保存に失敗しました（容量不足の可能性があります）'); } }
 function loadQuickSettings(){ try{ var d=JSON.parse(localStorage.getItem(QLS_KEY)); return (d&&typeof d==='object')?d:{}; }catch(e){ return {}; } }
 function saveQuickSettings(){
-  try{ localStorage.setItem(QLS_KEY, JSON.stringify({dist:state.distPreset, custom:state.customDist, corr:state.correction, name:els.qPlayerName.value})); }catch(e){}
+  try{ localStorage.setItem(QLS_KEY, JSON.stringify({dist:state.distPreset, custom:state.customDist, corr:state.correction, name:els.qPlayerName.value, height:state.heightCm, camDist:state.camDistM})); }catch(e){}
 }
 
 function toast(msg){
@@ -1313,6 +1344,8 @@ function syncDistUI(){
   els.qCorr.value=state.correction; els.corr.value=state.correction;
   var lbl=state.correction.toFixed(1)+'m';
   els.qCorrVal.textContent=lbl; els.corrVal.textContent=lbl;
+  els.qHeight.value=state.heightCm; els.heightInput.value=state.heightCm;
+  els.qCamDist.value=state.camDistM; els.camDistInput.value=state.camDistM;
 }
 els.qDistPreset.addEventListener('change', function(){ state.distPreset=els.qDistPreset.value; syncDistUI(); saveQuickSettings(); updateResult(); });
 els.distPreset.addEventListener('change', function(){ state.distPreset=els.distPreset.value; syncDistUI(); saveQuickSettings(); updateResult(); });
@@ -1320,6 +1353,33 @@ els.qCustomDist.addEventListener('input', function(){ state.customDist=els.qCust
 els.customDist.addEventListener('input', function(){ state.customDist=els.customDist.value; els.qCustomDist.value=state.customDist; saveQuickSettings(); updateResult(); });
 els.qCorr.addEventListener('input', function(){ state.correction=Number(els.qCorr.value); syncDistUI(); saveQuickSettings(); updateResult(); });
 els.corr.addEventListener('input', function(){ state.correction=Number(els.corr.value); syncDistUI(); saveQuickSettings(); updateResult(); });
+// リリース補正値をスライダーの step=0.1 に丸めて 0〜3 にクランプする
+function clampCorrection(v){
+  if(!isFinite(v)) v=0;
+  v=Math.round(v*10)/10;
+  return Math.max(0, Math.min(3, v));
+}
+// 身長入力（クイック/詳細の双方向同期）。有効な身長が入ればリリース補正を「身長m×0.7」に自動設定。空にしても補正値はそのまま維持する
+function onHeightInput(src){
+  state.heightCm=src.value;
+  var other=(src===els.qHeight)?els.heightInput:els.qHeight;
+  other.value=state.heightCm;
+  var adv=KYU.releaseAdvanceFromHeight(state.heightCm);
+  if(adv!=null) state.correction=clampCorrection(adv);
+  syncDistUI(); saveQuickSettings(); updateResult();
+}
+els.qHeight.addEventListener('input', function(){ onHeightInput(els.qHeight); });
+els.heightInput.addEventListener('input', function(){ onHeightInput(els.heightInput); });
+// カメラ〜ミット距離入力（クイック/詳細の双方向同期・音速遅延補正に使用。既定10m）
+function onCamDistInput(src){
+  var other=(src===els.qCamDist)?els.camDistInput:els.qCamDist;
+  other.value=src.value;
+  var v=parseFloat(src.value);
+  if(isFinite(v) && v>=0) state.camDistM=v;
+  saveQuickSettings();
+}
+els.qCamDist.addEventListener('input', function(){ onCamDistInput(els.qCamDist); });
+els.camDistInput.addEventListener('input', function(){ onCamDistInput(els.camDistInput); });
 function selectedDistance(){
   if(state.distPreset==='custom'){
     var v=parseFloat(state.customDist);
@@ -1611,12 +1671,16 @@ function qAnalyze(blob){
       return scanMotion(v, fps, function(pct){ setQStatus('ana','解析中… '+pct+'%','映像の動き量を解析しています'); }, times).then(function(motion){
         setQStatus('ana','解析中…','音声の捕球音ピークを解析しています');
         return scanAudio(blob).then(function(audio){
-          var est=KYU.estimateFrames(motion, fps, (audio && audio.ok) ? audio.peakSec : null, times);
+          // 音速遅延補正: 音声由来のピーク時刻からカメラ〜ミット距離 state.camDistM 分の遅延(音速343m/s)を差し引く（0未満にはしない）
+          var audioPeakSec=(audio && audio.ok) ? KYU.applySoundDelay(audio.peakSec, state.camDistM) : null;
+          var delayMs=(audio && audio.ok) ? Math.round(KYU.soundDelaySec(state.camDistM)*1000) : 0;
+          var est=KYU.estimateFrames(motion, fps, audioPeakSec, times);
           state.releaseTime = (times && times.length) ? times[Math.min(est.releaseIdx, times.length-1)] : est.releaseIdx/fps;
           state.arrivalTime = (times && times.length) ? times[Math.min(est.arrivalIdx, times.length-1)] : est.arrivalIdx/fps;
-          q.arrivalSource = est.arrivalSource==='audio'
+          var base=est.arrivalSource==='audio'
             ? ((audio && audio.source==='onset') ? 'audio-onset' : 'audio-envelope')
             : est.arrivalSource;
+          q.arrivalSource=(est.arrivalSource==='audio' && delayMs>0) ? base+'（音速補正 -'+delayMs+'ms）' : base;
           els.qResultCard.hidden=false; // 結果パネルを先に可視化してから描画する
           // 詳しく測る用に同じ動画を詳細ビューへも読み込む
           loadDetailVideo(blob, 'クイック計測の録画', true);
@@ -1686,10 +1750,13 @@ function renderQuickResult(){
   }
   els.qRelInfo.textContent=markText(state.releaseTime);
   els.qArrInfo.textContent=markText(state.arrivalTime);
+  var src=q.arrivalSource||'';
+  var ci=src.indexOf('（音速補正');
+  var corrSuffix=ci>=0 ? ' '+src.slice(ci) : '';
   els.qArrSource.textContent =
-    q.arrivalSource==='audio-onset' ? '到達候補: 捕球音のオンセット検出（web-audio-beat-detector）から推定'
-    : (q.arrivalSource==='audio-envelope' || q.arrivalSource==='audio') ? '到達候補: ミット捕球音（音声最大ピーク）から推定'
-    : (q.arrivalSource==='motion' ? '到達候補: 映像の動きが急停止したフレームから推定（音声ピークなし）' : '到達候補: フォールバック推定');
+    src.indexOf('audio-onset')===0 ? '到達候補: 捕球音のオンセット検出（web-audio-beat-detector）から推定'+corrSuffix
+    : (src.indexOf('audio-envelope')===0 || src==='audio') ? '到達候補: ミット捕球音（音声最大ピーク）から推定'+corrSuffix
+    : (src==='motion' ? '到達候補: 映像の動きが急停止したフレームから推定（音声ピークなし）' : '到達候補: フォールバック推定');
 }
 // ±1F 微調整。frameTimes があればフレーム単位でずらし、無ければ時間軸でずらす
 function shiftByFrames(t, delta){
@@ -2277,6 +2344,10 @@ els.shareCurrentBtn.addEventListener('click', function(){
   if(typeof qs.custom==='string') state.customDist=qs.custom;
   if(typeof qs.corr==='number' && isFinite(qs.corr)) state.correction=qs.corr;
   if(typeof qs.name==='string'){ els.qPlayerName.value=qs.name; els.playerName.value=qs.name; }
+  // 旧データ（height/camDist 無し）でも壊れないよう、存在する場合だけ復元
+  if(typeof qs.height==='number' && isFinite(qs.height) && qs.height>0) state.heightCm=String(qs.height);
+  else if(typeof qs.height==='string' && qs.height!=='') state.heightCm=qs.height;
+  if(typeof qs.camDist==='number' && isFinite(qs.camDist) && qs.camDist>=0) state.camDistM=qs.camDist;
   syncDistUI();
   setControlsEnabled(false);
   updateFrameUI(); updateMarks(); updateResult();
