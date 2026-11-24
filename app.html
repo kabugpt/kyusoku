@@ -105,10 +105,27 @@ footer{margin-top:20px;}
 
   <section class="card">
     <h2>1. 動画を読み込む</h2>
-    <label class="btn btn-primary file-btn">動画ファイルを選ぶ
-      <input type="file" id="fileInput" accept="video/*" hidden>
-    </label>
-    <p id="fileName" class="muted small">未選択</p>
+    <div class="seg" id="modeSeg">
+      <button data-mode="file" class="active">ファイルから選ぶ</button>
+      <button data-mode="camera">カメラで撮る</button>
+    </div>
+    <div id="filePanel" style="margin-top:10px">
+      <label class="btn btn-primary file-btn">動画ファイルを選ぶ
+        <input type="file" id="fileInput" accept="video/*" hidden>
+      </label>
+      <p id="fileName" class="muted small">未選択</p>
+    </div>
+    <div id="camPanel" hidden style="margin-top:10px">
+      <video id="camVideo" playsinline muted autoplay></video>
+      <p id="camStatus" class="muted small">カメラを起動します…</p>
+      <p id="camFps" class="muted small"></p>
+      <div class="mark-row" style="margin-top:8px">
+        <button class="btn btn-primary" id="recStart">録画開始</button>
+        <button class="btn btn-accent" id="recStop" disabled>録画停止</button>
+      </div>
+      <p id="recInfo" class="muted small"></p>
+    </div>
+    <p id="modeMsg" class="err" hidden></p>
     <details class="guide">
       <summary>撮影ガイドを見る</summary>
       <ul>
@@ -117,6 +134,7 @@ footer{margin-top:20px;}
         <li>リリースから捕球（ミット到達）までボールが画面から切れない構図にする</li>
         <li>三脚などでスマホを固定し、明るい場所で撮る</li>
         <li>ボールが見やすい単色の背景（ネット・フェンス等）がよい</li>
+        <li>アプリ内撮影は端末・ブラウザ仕様で最大60fps程度のため、240fps級の精度が要る場合はカメラアプリのスローモーション撮影＋ファイル選択が推奨</li>
       </ul>
     </details>
   </section>
@@ -205,6 +223,9 @@ var FONT='"Hiragino Kaku Gothic ProN","Hiragino Sans","Noto Sans JP",Meiryo,sans
 function $(id){return document.getElementById(id);}
 var els={
   video:$('video'), file:$('fileInput'), fileName:$('fileName'), noVideo:$('noVideo'),
+  modeSeg:$('modeSeg'), filePanel:$('filePanel'), camPanel:$('camPanel'),
+  camVideo:$('camVideo'), camStatus:$('camStatus'), camFps:$('camFps'),
+  recStart:$('recStart'), recStop:$('recStop'), recInfo:$('recInfo'), modeMsg:$('modeMsg'),
   seek:$('seek'), frameInfo:$('frameInfo'),
   playBtn:$('playBtn'), back1:$('back1'), back10:$('back10'), fwd1:$('fwd1'), fwd10:$('fwd10'),
   fpsSeg:$('fpsSeg'), speedSeg:$('speedSeg'),
@@ -219,6 +240,7 @@ var els={
 var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, loaded:false, seeking:false };
 var objectUrl=null;
 var dragging=false;
+var camStream=null, camStarting=false, mediaRec=null, recChunks=[], recActive=false, recMime='', recTimer=null, recStartAt=0;
 
 function frameDur(){ return 1/state.fps; }
 function curFrame(){ return els.video.duration ? Math.round(els.video.currentTime/frameDur()) : 0; }
@@ -246,11 +268,8 @@ function setControlsEnabled(on){
 els.file.addEventListener('change', function(){
   var f=els.file.files && els.file.files[0];
   if(!f) return;
-  if(objectUrl) URL.revokeObjectURL(objectUrl);
-  objectUrl=URL.createObjectURL(f);
-  els.video.src=objectUrl;
-  els.video.load();
-  els.fileName.textContent=f.name+'（'+(f.size/1048576).toFixed(1)+' MB）';
+  hideModeMsg();
+  loadVideoSource(f, f.name);
 });
 els.video.addEventListener('loadedmetadata', function(){
   state.loaded=true;
@@ -268,6 +287,180 @@ els.video.addEventListener('pause', function(){ els.playBtn.textContent='再生'
 els.video.addEventListener('click', function(){
   if(!state.loaded) return;
   if(els.video.paused){ els.video.play(); } else { els.video.pause(); }
+});
+
+/* ---- 動画ソース読み込み（ファイル選択 / カメラ録画の共通入口） ---- */
+function loadVideoSource(blob, label){
+  if(camStream) stopCamera();
+  if(objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl=URL.createObjectURL(blob);
+  els.video.srcObject=null;
+  els.video.src=objectUrl;
+  els.video.load();
+  els.fileName.textContent=label+'（'+(blob.size/1048576).toFixed(1)+' MB）';
+  state.loaded=false;
+  state.releaseTime=null; state.arrivalTime=null;
+  setControlsEnabled(false);
+  els.seek.max=0; els.seek.value=0;
+  updateFrameUI(); updateMarks(); updateResult();
+}
+
+/* ---- 入力モード切替（ファイル / カメラ撮影） ---- */
+function hideModeMsg(){ els.modeMsg.hidden=true; els.modeMsg.textContent=''; }
+function showModeError(msg){
+  setMode('file', true);
+  els.modeMsg.textContent=msg;
+  els.modeMsg.hidden=false;
+  toast(msg);
+}
+function setMode(m, keepMsg){
+  if(!keepMsg) hideModeMsg();
+  Array.prototype.forEach.call(els.modeSeg.children, function(x){ x.classList.toggle('active', x.dataset.mode===m); });
+  els.filePanel.hidden = m!=='file';
+  els.camPanel.hidden = m!=='camera';
+  if(m==='camera'){ startCamera(); }
+  else{ stopCamera(); }
+}
+els.modeSeg.addEventListener('click', function(e){
+  var b=e.target.closest('button'); if(!b) return;
+  setMode(b.dataset.mode);
+});
+
+/* ---- カメラ撮影（getUserMedia + MediaRecorder） ---- */
+function stopCamera(){
+  if(recActive && mediaRec){ try{ mediaRec.stop(); }catch(e){} }
+  if(camStream){ camStream.getTracks().forEach(function(t){ t.stop(); }); camStream=null; }
+  if(els.camVideo.srcObject){ els.camVideo.srcObject=null; }
+  camStarting=false;
+}
+function applyDetectedFps(stream){
+  var t=stream.getVideoTracks()[0];
+  var st=(t && t.getSettings) ? t.getSettings() : null;
+  var fr=(st && typeof st.frameRate==='number') ? st.frameRate : null;
+  if(fr && fr>0){
+    var best=null, bd=Infinity;
+    Array.prototype.forEach.call(els.fpsSeg.children, function(b){
+      var d=Math.abs(Number(b.dataset.fps)-fr);
+      if(d<bd){ bd=d; best=b; }
+    });
+    if(best){
+      setFps(Number(best.dataset.fps), best);
+      els.camFps.textContent='カメラ検出フレームレート 約'+fr.toFixed(1)+'fps → fps選択を「'+best.dataset.fps+'」に自動反映しました';
+    }
+  }else{
+    els.camFps.textContent='フレームレートを取得できなかったため、fpsは手動選択のままです';
+  }
+}
+function startCamera(){
+  if(camStream) return Promise.resolve(true);
+  if(camStarting) return Promise.resolve(false);
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showModeError(window.isSecureContext===false
+      ? 'このページは安全な接続（HTTPS）で開かれていないためカメラを使えません。動画ファイルを選んでください。'
+      : 'このブラウザはカメラ（getUserMedia）に対応していないため撮影できません。動画ファイルを選んでください。');
+    return Promise.resolve(false);
+  }
+  if(typeof MediaRecorder==='undefined'){
+    showModeError('このブラウザは録画（MediaRecorder）に対応していないためカメラ撮影は使えません。動画ファイルを選んでください。');
+    return Promise.resolve(false);
+  }
+  camStarting=true;
+  els.recStart.disabled=true;
+  els.camStatus.textContent='カメラを起動しています…';
+  var constraints={ audio:false, video:{ facingMode:'environment', frameRate:{ ideal:60, max:60 } } };
+  return navigator.mediaDevices.getUserMedia(constraints).then(function(stream){
+    camStarting=false;
+    camStream=stream;
+    els.camVideo.srcObject=stream;
+    var p=els.camVideo.play(); if(p && p.catch) p.catch(function(){});
+    applyDetectedFps(stream);
+    els.camStatus.textContent='ライブプレビュー中（背面カメラ）。「録画開始」で撮影できます';
+    els.recStart.disabled=false;
+    hideModeMsg();
+    return true;
+  }).catch(function(err){
+    camStarting=false;
+    stopCamera();
+    els.recStart.disabled=false;
+    var map={
+      NotAllowedError:'カメラの使用が拒否されました。ブラウザの設定でこのサイトのカメラを「許可」にしてください。',
+      NotFoundError:'カメラが見つかりません。カメラ搭載の端末で開いてください。',
+      OverconstrainedError:'この端末では背面カメラ（facingMode: environment）をその条件で開けませんでした。',
+      NotReadableError:'カメラが他のアプリで使用中の可能性があります。他のアプリを閉じてからお試しください。',
+      SecurityError:'セキュリティ上の理由でカメラを使えません。'
+    };
+    var msg=map[err && err.name] || ('カメラの起動に失敗しました（'+(err && err.name || 'Error')+'）');
+    showModeError(msg+' 動画ファイルを選んでください。');
+    return false;
+  });
+}
+function pickRecMime(){
+  var cands=['video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'];
+  for(var i=0;i<cands.length;i++){
+    if(MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(cands[i])) return cands[i];
+  }
+  return '';
+}
+function startRecTimer(){
+  recStartAt=Date.now();
+  recTimer=setInterval(function(){
+    els.recInfo.textContent='録画中… '+((Date.now()-recStartAt)/1000).toFixed(1)+'s — 「録画停止」を押すと計測に読み込みます';
+  },100);
+}
+function stopRecTimer(){ if(recTimer){ clearInterval(recTimer); recTimer=null; } }
+function startRecording(){
+  recChunks=[];
+  var mime=pickRecMime();
+  try{
+    mediaRec = mime ? new MediaRecorder(camStream, {mimeType:mime}) : new MediaRecorder(camStream);
+  }catch(e){
+    els.recStart.disabled=false;
+    showModeError('録画の開始に失敗しました（'+(e && e.name || 'Error')+'）。動画ファイルを選んでください。');
+    return;
+  }
+  recMime=mediaRec.mimeType || mime || 'video/webm';
+  mediaRec.ondataavailable=function(e){ if(e.data && e.data.size>0) recChunks.push(e.data); };
+  mediaRec.onstop=onRecStop;
+  try{ mediaRec.start(250); }catch(e){
+    els.recStart.disabled=false;
+    showModeError('録画の開始に失敗しました。動画ファイルを選んでください。');
+    return;
+  }
+  recActive=true;
+  els.recStart.disabled=true; els.recStart.textContent='録画中…';
+  els.recStop.disabled=false;
+  startRecTimer();
+}
+function onRecStop(){
+  recActive=false;
+  stopRecTimer();
+  els.recStart.disabled=false; els.recStart.textContent='録画開始';
+  els.recStop.disabled=true;
+  var blob=new Blob(recChunks, {type:recMime});
+  recChunks=[];
+  if(!blob.size){
+    els.recInfo.textContent='';
+    showModeError('録画データが空でした。もう一度撮影するか、動画ファイルを選んでください。');
+    return;
+  }
+  var ext = recMime.indexOf('mp4')>=0 ? 'mp4' : 'webm';
+  stopCamera();
+  loadVideoSource(blob, 'カメラ撮影（'+ext+'）');
+  els.camStatus.textContent='録画を計測に読み込みました。「録画開始」で再撮影できます';
+  els.camFps.textContent='';
+  els.recInfo.textContent='';
+  toast('録画を読み込みました。コマ送りでリリース点と到達点を指定してください');
+}
+els.recStart.addEventListener('click', function(){
+  if(recActive || camStarting) return;
+  hideModeMsg();
+  startCamera().then(function(ok){
+    if(ok && camStream) startRecording();
+  });
+});
+els.recStop.addEventListener('click', function(){
+  if(!recActive || !mediaRec) return;
+  try{ mediaRec.stop(); }catch(e){}
 });
 
 /* ---- シーク / コマ送り ---- */
@@ -311,12 +504,15 @@ els.seek.addEventListener('input', function(){
 });
 
 /* ---- fps / 再生速度 ---- */
-els.fpsSeg.addEventListener('click', function(e){
-  var b=e.target.closest('button'); if(!b) return;
-  state.fps=Number(b.dataset.fps);
-  Array.prototype.forEach.call(els.fpsSeg.children, function(x){ x.classList.toggle('active', x===b); });
+function setFps(fps, btn){
+  state.fps=fps;
+  Array.prototype.forEach.call(els.fpsSeg.children, function(x){ x.classList.toggle('active', x===btn); });
   if(state.loaded){ els.seek.max=totalFrames(); els.seek.value=curFrame(); }
   updateFrameUI(); updateMarks(); updateResult();
+}
+els.fpsSeg.addEventListener('click', function(e){
+  var b=e.target.closest('button'); if(!b) return;
+  setFps(Number(b.dataset.fps), b);
 });
 els.speedSeg.addEventListener('click', function(e){
   var b=e.target.closest('button'); if(!b) return;
