@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.10 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.11 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -1900,6 +1900,7 @@ var KYU=(function(){
   var FINE_DIFF_THR=60;    // 基準フレーム差分のしきい値（グレースケール）
   var FINE_MIN_PX=4;       // 精段で採用する最小ブロブピクセル数
   var FINE_MAX_GAP=8;      // 等速外挿を許す最大フレームギャップ
+  var FINE_RETRY_MAX=3;    // 精段の適応リトライの倍率上限（失敗時に切り出し半サイズを half, 2*half, 3*half と広げる）
   var QUIET_SEC=0.5;       // 基準フレーム探索のためリリース前に遡る秒数
 
   // 差分配列から強度重み付きサブピクセル重心を求める純粋関数
@@ -2013,19 +2014,25 @@ var KYU=(function(){
   // 精段: 基準フレーム差分＋サブピクセル重心で [firstIdx,lastIdx] のボール重心列を求める（純粋ロジック）
   // getPair(i,x0,y0,cw,ch) -> Promise<{base,cur}|null> : 作業座標で切り出した基準/現フレームのグレー（cw×ch）
   // coarse: [{i,x,y}] 粗段候補（作業座標px。予測位置の初期化・再初期化に使う）
-  // o: {refIdx, width, height, half=40, threshold=60, minPx=4, maxGap=8, firstIdx, lastIdx}
-  // 戻り値 Promise {ok, points:[{i,x,y,n}], missing:[i], refIdx}（points は作業座標。ok は5点以上取れたか）
+  // o: {refIdx, width, height, half=40, threshold=60, minPx=4, maxGap=8, retryMax=3, firstIdx, lastIdx}
+  // 戻り値 Promise {ok, points:[{i,x,y,n,m}], missing:[i], retries:[{i,m}], refIdx}
+  //   （points は作業座標。m は採用時の切り出し倍率。ok は5点以上取れたか）
+  // 適応リトライ: 1フレームの抽出に失敗した場合、予測中心は変えず切り出し半サイズだけを
+  //   half → 2*half → … → retryMax*half と広げてその場で再試行する。最後は画像サイズで頭打ちの
+  //   絶対上限（halfAbsCap=max(width,height)。切り出し窓が作業画像全体を超えない）で1回だけ試す。
+  //   無制限には広げない
   function refineBallPath(getPair, coarse, o){
     o=o||{};
     var width=Math.floor(Number(o.width)), height=Math.floor(Number(o.height));
     var refIdx0=Math.max(0, Math.round(Number(o.refIdx)||0));
     if(!(width>0) || !(height>0) || typeof getPair!=='function'){
-      return Promise.resolve({ok:false, reason:'bad-args', points:[], missing:[], refIdx:refIdx0});
+      return Promise.resolve({ok:false, reason:'bad-args', points:[], missing:[], retries:[], refIdx:refIdx0});
     }
     var half=Math.max(2, Math.floor(Number(o.half)||FINE_HALF));
     var thr=(typeof o.threshold==='number' && isFinite(o.threshold)) ? o.threshold : FINE_DIFF_THR;
     var minPx=(typeof o.minPx==='number' && o.minPx>0) ? Math.floor(o.minPx) : FINE_MIN_PX;
     var maxGap=(typeof o.maxGap==='number' && o.maxGap>0) ? o.maxGap : FINE_MAX_GAP;
+    var retryMax=Math.max(1, Math.floor((typeof o.retryMax==='number' && isFinite(o.retryMax) && o.retryMax>=1) ? o.retryMax : FINE_RETRY_MAX));
     var fi0=Math.max(0, Math.round(Number(o.firstIdx)||0));
     var fi1=Math.max(fi0, Math.round(Number(o.lastIdx)||0));
     var sorted=(coarse||[]).filter(function(c){ return c && isFinite(c.i) && isFinite(c.x) && isFinite(c.y); })
@@ -2043,9 +2050,15 @@ var KYU=(function(){
       var a0=sorted[0], a1=sorted[sorted.length-1], di=Math.max(1, a1.i-a0.i);
       vel={x:(a1.x-a0.x)/di, y:(a1.y-a0.y)/di};
     }
-    var points=[], missing=[], last=null;
+    var points=[], missing=[], retries=[], last=null;
+    // 適応リトライの倍率列: 1, 2, …, retryMax, （それでもダメなら）画像サイズで頭打ちの絶対上限
+    var halfAbsCap=Math.max(width, height); // 切り出し窓が作業画像全体を超えないための絶対上限
+    var mults=[1], m;
+    for(m=2;m<=retryMax;m++) mults.push(m);
+    var capMult=Math.ceil(halfAbsCap/half);
+    if(capMult>mults[mults.length-1]) mults.push(capMult);
     function step(i){
-      if(i>fi1) return {ok:points.length>=5, points:points, missing:missing, refIdx:refIdx0};
+      if(i>fi1) return {ok:points.length>=5, points:points, missing:missing, retries:retries, refIdx:refIdx0};
       // 予測位置 = 粗段軌跡（未ロック時）または 前回重心＋等速外挿（ロック時。粗段と矛盾しない範囲で粗段も混合）
       var pred;
       if(last && (i-last.i)<=maxGap){
@@ -2061,25 +2074,40 @@ var KYU=(function(){
         else if(last) pred={x:last.x+vel.x*(i-last.i), y:last.y+vel.y*(i-last.i)};
         else pred={x:width/2, y:height/2};
       }
-      // 切り出しは予測位置±half に絞る（画像端では切り詰める）
-      var x0=Math.max(0, Math.round(pred.x-half)), y0=Math.max(0, Math.round(pred.y-half));
-      var x1=Math.min(width-1, Math.ceil(pred.x+half)), y1=Math.min(height-1, Math.ceil(pred.y+half));
-      var cw=x1-x0+1, ch=y1-y0+1;
-      if(cw<3 || ch<3){ missing.push(i); return Promise.resolve(step(i+1)); }
-      return Promise.resolve().then(function(){ return getPair(i, x0, y0, cw, ch); }).then(function(pair){
-        var c=null;
-        if(pair && pair.base && pair.cur && pair.base.length>=cw*ch && pair.cur.length>=cw*ch){
-          c=centroidFromCrop(pair.base, pair.cur, cw, ch, x0, y0, thr);
+      // 切り出しは予測位置±h に絞る（画像端では切り詰める）。失敗時は適応リトライで h を広げる（予測中心は変えない）
+      function attempt(i2, pred2, mi){
+        var h=Math.min(half*mults[mi], halfAbsCap);
+        var x0=Math.max(0, Math.round(pred2.x-h)), y0=Math.max(0, Math.round(pred2.y-h));
+        var x1=Math.min(width-1, Math.ceil(pred2.x+h)), y1=Math.min(height-1, Math.ceil(pred2.y+h));
+        var cw=x1-x0+1, ch=y1-y0+1;
+        if(cw<3 || ch<3){ // 窓が画像外に entirely 出ている
+          if(mi+1<mults.length) return attempt(i2, pred2, mi+1);
+          return Promise.resolve(null);
         }
-        if(c && c.n>=minPx){
-          points.push({i:i, x:c.x, y:c.y, n:c.n});
-          if(last && i>last.i){ vel={x:(c.x-last.x)/(i-last.i), y:(c.y-last.y)/(i-last.i)}; }
-          last={i:i, x:c.x, y:c.y};
+        return Promise.resolve().then(function(){ return getPair(i2, x0, y0, cw, ch); }).then(function(pair){
+          var c=null;
+          if(pair && pair.base && pair.cur && pair.base.length>=cw*ch && pair.cur.length>=cw*ch){
+            c=centroidFromCrop(pair.base, pair.cur, cw, ch, x0, y0, thr);
+          }
+          if(c && c.n>=minPx) return {c:c, m:mults[mi]};
+          if(mi+1<mults.length) return attempt(i2, pred2, mi+1); // 適応リトライ（予測中心はそのまま、窓だけ広げる）
+          return null;
+        }, function(){
+          if(mi+1<mults.length) return attempt(i2, pred2, mi+1);
+          return null;
+        });
+      }
+      return attempt(i, pred, 0).then(function(r){
+        if(r && r.c){
+          points.push({i:i, x:r.c.x, y:r.c.y, n:r.c.n, m:r.m});
+          if(r.m>1) retries.push({i:i, m:r.m});
+          if(last && i>last.i){ vel={x:(r.c.x-last.x)/(i-last.i), y:(r.c.y-last.y)/(i-last.i)}; }
+          last={i:i, x:r.c.x, y:r.c.y};
         }else{
           missing.push(i); // 精段失敗フレームは欠落扱い（品質ゲートに委ねる）
         }
         return step(i+1);
-      }, function(){ missing.push(i); return step(i+1); });
+      });
     }
     return Promise.resolve(step(fi0));
   }
@@ -2091,15 +2119,16 @@ var KYU=(function(){
   //   width, height,                                       // 動画の実解像度
   //   releaseIdx, arrivalIdx, fps, frameTimes?, totalFrames?,
   //   scanW=64, scanH=36, enableFine=true,
-  //   fineMaxW=1280, fineHalf=40, fineThr=60, fineMinPx=4, maxGap=8, quietSec=0.5,
+  //   fineMaxW=1280, fineHalf=40, fineThr=60, fineMinPx=4, maxGap=8, fineRetryMax=3, quietSec=0.5,
   //   diffThr=18, minPx=3, searchR=9, motionMin=0.3, bandHalf=10
   // }
-  // 戻り値 Promise {mode:'fine'|'coarse', samples, coarseSamples, points, missing, refIdx, fi0, fi1, scale}（samplesは実映像pxの {t,xPx,yPx} 列）
+  // 戻り値 Promise {mode:'fine'|'coarse', samples, coarseSamples, points, missing, retries, refIdx, fi0, fi1, scale}
+  //   （samplesは実映像pxの {t,xPx,yPx} 列。retries は精段の適応リトライで広げ窓が採用された点 [{i,m}]）
   // 精段全体が失敗した場合は mode:'coarse' で粗段のみ（従来動作）にフォールバックする
   function extractBallPathStaged(o){
     o=o||{};
     var vw=Math.floor(Number(o.width)), vh=Math.floor(Number(o.height));
-    var base={mode:'coarse', samples:[], coarseSamples:[], points:[], missing:[], refIdx:0, fi0:0, fi1:0, scale:null, error:null};
+    var base={mode:'coarse', samples:[], coarseSamples:[], points:[], missing:[], retries:[], refIdx:0, fi0:0, fi1:0, scale:null, error:null};
     if(!(vw>0) || !(vh>0) || typeof o.getFrame!=='function'){
       base.error='bad-args'; return Promise.resolve(base);
     }
@@ -2171,10 +2200,10 @@ var KYU=(function(){
       var coarseWork=cands.map(function(c){ return {i:c.i, x:c.x*scaleX*s, y:c.y*scaleY*s}; });
       return refineBallPath(getPair, coarseWork, {
         refIdx:b.refIdx, width:Ww, height:Wh,
-        half:o.fineHalf, threshold:o.fineThr, minPx:o.fineMinPx, maxGap:o.maxGap,
+        half:o.fineHalf, threshold:o.fineThr, minPx:o.fineMinPx, maxGap:o.maxGap, retryMax:o.fineRetryMax,
         firstIdx:fi0, lastIdx:fi1
       }).then(function(r){
-        b.points=r.points||[]; b.missing=r.missing||[];
+        b.points=r.points||[]; b.missing=r.missing||[]; b.retries=r.retries||[];
         if(r.refIdx!=null) b.refIdx=r.refIdx;
         if(r.ok && b.points.length>=5){
           var fineCands=b.points.map(function(p){ return {i:p.i, x:p.x/(scaleX*s), y:p.y/(scaleY*s)}; });
@@ -2207,7 +2236,7 @@ var KYU=(function(){
     TRAJ_DIFF_THR:TRAJ_DIFF_THR, TRAJ_MIN_PX:TRAJ_MIN_PX, TRAJ_SEARCH_R:TRAJ_SEARCH_R,
     TRAJ_BAND_HALF:TRAJ_BAND_HALF, TRAJ_MOTION_MIN:TRAJ_MOTION_MIN,
     FINE_MAX_W:FINE_MAX_W, FINE_HALF:FINE_HALF, FINE_DIFF_THR:FINE_DIFF_THR,
-    FINE_MIN_PX:FINE_MIN_PX, FINE_MAX_GAP:FINE_MAX_GAP, QUIET_SEC:QUIET_SEC,
+    FINE_MIN_PX:FINE_MIN_PX, FINE_MAX_GAP:FINE_MAX_GAP, FINE_RETRY_MAX:FINE_RETRY_MAX, QUIET_SEC:QUIET_SEC,
     centroidFromDiff:centroidFromDiff, centroidFromCrop:centroidFromCrop, centroidAround:centroidAround,
     pickQuietFrame:pickQuietFrame, blobCentroid:blobCentroid, buildTrajSamples:buildTrajSamples,
     refineBallPath:refineBallPath, extractBallPathStaged:extractBallPathStaged
@@ -3882,6 +3911,7 @@ var FINE_MAX_W=KYU.FINE_MAX_W;   // 精段の作業解像度の幅上限（こ�
 var FINE_HALF=KYU.FINE_HALF;     // 精段の切り出し半サイズ（作業px。予測位置±この値）
 var FINE_DIFF_THR=KYU.FINE_DIFF_THR; // 精段の基準フレーム差分しきい値
 var FINE_MIN_PX=KYU.FINE_MIN_PX; // 精段で採用する最小ブロブピクセル数
+var FINE_RETRY_MAX=KYU.FINE_RETRY_MAX; // 精段の適応リトライの倍率上限（失敗時に切り出し半サイズを広げる段階数）
 var QUIET_SEC=KYU.QUIET_SEC;     // 基準フレーム探索のためリリース前に遡る秒数
 var trajEls=null;
 // 探索窓内で |grayB-grayA|>thr のピクセルの重心（差分量で重み付け）を返す。無ければ null（実体はKYUに移動）
@@ -3997,7 +4027,7 @@ function extractBallPathStagedVideo(v, o){
     frameTimes:ft, fps:fps, totalFrames:totalFrames(),
     scanW:SCAN_W, scanH:SCAN_H, enableFine:true,
     fineMaxW:FINE_MAX_W, fineHalf:FINE_HALF, fineThr:FINE_DIFF_THR, fineMinPx:FINE_MIN_PX,
-    maxGap:KYU.FINE_MAX_GAP, quietSec:QUIET_SEC,
+    maxGap:KYU.FINE_MAX_GAP, fineRetryMax:FINE_RETRY_MAX, quietSec:QUIET_SEC,
     diffThr:TRAJ_DIFF_THR, minPx:TRAJ_MIN_PX, searchR:TRAJ_SEARCH_R,
     motionMin:TRAJ_MOTION_MIN, bandHalf:TRAJ_BAND_HALF
   });
