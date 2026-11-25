@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.8 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.9 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -1737,6 +1737,310 @@ var KYU=(function(){
     return {ivbCm:ivbCm, fit:fit};
   }
 
+  /* ---- 二段抽出（ボール軌道抽出の高解像度化）: 純粋関数群 ----
+     粗段: 従来どおり 64×36 スキャンのフレーム間差分ブロブ重心で大まかな軌跡と時刻窓を得る
+     精段: リリース〜到達の各フレームについて「粗段軌跡＋等速外挿」で予測した位置の周辺だけを
+           原寸解像度（幅 FINE_MAX_W 相当まで）で切り出し、投球前の静止基準フレームとの差分
+           （フレーム間差分ではなく基準フレーム差分）の強度重み付きサブピクセル重心をボール位置とする */
+
+  // 粗段（従来方式）の既定値。app 側の TRAJ_* 変数の単一ソース
+  var TRAJ_DIFF_THR=18;    // グレースケール差分のしきい値
+  var TRAJ_MIN_PX=3;       // 候補とみなす最小変化ピクセル数
+  var TRAJ_SEARCH_R=9;     // 探索窓の半径（スキャン座標px。初回は全画面）
+  var TRAJ_BAND_HALF=10;   // 帯状ROIの半幅（スキャン座標px）
+  var TRAJ_MOTION_MIN=0.3; // フレーム間動き量の下限（motionMetric の 0-255 スケール換算）
+  // 精段の既定値
+  var FINE_MAX_W=1280;     // 精段の作業解像度の幅上限（動画がこれより広い場合はこの幅相当に縮小）
+  var FINE_HALF=40;        // 精段の切り出し半サイズ（作業px。予測位置±この値に絞る）
+  var FINE_DIFF_THR=60;    // 基準フレーム差分のしきい値（グレースケール）
+  var FINE_MIN_PX=4;       // 精段で採用する最小ブロブピクセル数
+  var FINE_MAX_GAP=8;      // 等速外挿を許す最大フレームギャップ
+  var QUIET_SEC=0.5;       // 基準フレーム探索のためリリース前に遡る秒数
+
+  // 差分配列から強度重み付きサブピクセル重心を求める純粋関数
+  // diff: 長さ width*height の数値配列（符号付き差分でもよい。絶対値で重み付け）
+  // threshold: |diff|>threshold のピクセルのみ対象（無効なら0）
+  // 戻り値 {x,y,w,n}（x,y: 画素中心座標でのサブピクセル重心, w: 重み総和, n: 対象ピクセル数）。対象なし/不正なら null
+  function centroidFromDiff(diff, width, height, threshold){
+    width=Math.floor(Number(width)); height=Math.floor(Number(height));
+    if(!diff || !(width>0) || !(height>0) || diff.length<width*height) return null;
+    var thr=(typeof threshold==='number' && isFinite(threshold) && threshold>=0) ? threshold : 0;
+    var sw=0, sx=0, sy=0, n=0, x, y, a;
+    for(y=0;y<height;y++){
+      var row=y*width;
+      for(x=0;x<width;x++){
+        a=diff[row+x]; if(a<0) a=-a;
+        if(!(a>thr)) continue; // NaN もここで除外
+        sw+=a; sx+=a*x; sy+=a*y; n++;
+      }
+    }
+    if(!n || !(sw>0)) return null;
+    return {x:sx/sw, y:sy/sw, w:sw, n:n};
+  }
+
+  // 切り出し済みの基準/現フレームグレー（同サイズ cw×ch）の差分重心を元画像座標で返す純粋関数
+  function centroidFromCrop(base, cur, cw, ch, x0, y0, threshold){
+    cw=Math.floor(Number(cw)); ch=Math.floor(Number(ch));
+    if(!base || !cur || !(cw>0) || !(ch>0) || base.length<cw*ch || cur.length<cw*ch) return null;
+    var diff=new Float32Array(cw*ch), i;
+    for(i=0;i<cw*ch;i++){ diff[i]=cur[i]-base[i]; }
+    var c=centroidFromDiff(diff, cw, ch, threshold);
+    if(!c) return null;
+    return {x:c.x+Number(x0||0), y:c.y+Number(y0||0), w:c.w, n:c.n};
+  }
+
+  // 基準フレーム差分の局所重心（フルフレーム版）: baseGray/curGray は同サイズのグレースケール配列
+  // 予測位置 (cx,cy) の ±half の窓だけを切り出して cur-base の差分重心を作業座標で返す。失敗時 null
+  function centroidAround(baseGray, curGray, width, height, cx, cy, half, threshold){
+    width=Math.floor(Number(width)); height=Math.floor(Number(height));
+    if(!baseGray || !curGray || !(width>0) || !(height>0) ||
+       baseGray.length<width*height || curGray.length<width*height) return null;
+    var h=Math.max(2, Math.floor(Number(half)||0));
+    var x0=Math.max(0, Math.round(cx-h)), y0=Math.max(0, Math.round(cy-h));
+    var x1=Math.min(width-1, Math.ceil(cx+h)), y1=Math.min(height-1, Math.ceil(cy+h));
+    var cw=x1-x0+1, ch=y1-y0+1;
+    if(cw<1 || ch<1) return null;
+    var diff=new Float32Array(cw*ch), x, y;
+    for(y=0;y<ch;y++){
+      var rs=(y0+y)*width+x0, rd=y*cw;
+      for(x=0;x<cw;x++){ diff[rd+x]=curGray[rs+x]-baseGray[rs+x]; }
+    }
+    var c=centroidFromDiff(diff, cw, ch, threshold);
+    if(!c) return null;
+    return {x:c.x+x0, y:c.y+y0, w:c.w, n:c.n};
+  }
+
+  // 静止基準フレームの選択: 動き量列 motion（フレームindex対応）から [lo,hi] 区間で最小のフレームを返す
+  function pickQuietFrame(motion, lo, hi){
+    if(!motion || !motion.length) return Math.max(0, Math.floor(Number(lo)||0));
+    lo=Math.max(0, Math.floor(Number(lo)||0));
+    hi=Math.min(motion.length-1, Math.floor(Number(hi)||0));
+    if(!(hi>=lo)) hi=lo;
+    var best=lo, bv=Infinity, i, v;
+    for(i=lo;i<=hi;i++){
+      v=motion[i];
+      if(typeof v==='number' && isFinite(v) && v<bv){ bv=v; best=i; }
+    }
+    return best;
+  }
+
+  // 探索窓内で |grayB-grayA|>thr のピクセルの強度重み付き重心を返す（従来の粗段で使う純粋関数。無ければ null）
+  function blobCentroid(grayA, grayB, cx, cy, r, w, h, thr){
+    var x0=Math.max(0, Math.floor(cx-r)), x1=Math.min(w-1, Math.ceil(cx+r));
+    var y0=Math.max(0, Math.floor(cy-r)), y1=Math.min(h-1, Math.ceil(cy+r));
+    var sw=0, sx=0, sy=0, n=0, x, y, d;
+    for(y=y0;y<=y1;y++){
+      for(x=x0;x<=x1;x++){
+        d=grayB[y*w+x]-grayA[y*w+x];
+        if(d<0) d=-d;
+        if(d>thr){ sw+=d; sx+=d*x; sy+=d*y; n++; }
+      }
+    }
+    if(!n || !sw) return null;
+    return {x:sx/sw, y:sy/sw, n:n};
+  }
+
+  // 候補列を帯状ROI（先頭候補=リリース位置〜末尾候補=到達位置を結ぶ線分からの垂直距離）と
+  // x単調性で絞り込み、cands座標→実映像pxに変換して {t,xPx,yPx} 列を返す。bandHalf は cands の座標系で指定
+  function buildTrajSamples(cands, tOf, scaleX, scaleY, bandHalf){
+    var bh=(typeof bandHalf==='number' && isFinite(bandHalf)) ? bandHalf : TRAJ_BAND_HALF;
+    var mapOne=function(c){ return {t:tOf(c.i), xPx:c.x*scaleX, yPx:c.y*scaleY}; };
+    if(!cands || !cands.length) return [];
+    if(cands.length<2) return [mapOne(cands[0])];
+    var p0=cands[0], p1=cands[cands.length-1];
+    var dx=p1.x-p0.x, dy=p1.y-p0.y, len2=dx*dx+dy*dy;
+    var kept=cands;
+    if(len2>1e-9){
+      var len=Math.sqrt(len2);
+      kept=cands.filter(function(c){
+        var d=Math.abs(dy*(c.x-p0.x)-dx*(c.y-p0.y))/len; // 点と線分の垂直距離
+        return d<=bh;
+      });
+      if(kept.length<2) kept=cands;
+    }
+    var out=[], lastX=-1e12;
+    kept.forEach(function(c){
+      if(c.x>=lastX-1e-9){ out.push(mapOne(c)); lastX=c.x; } // x方向に単調に進む候補だけ繋ぐ
+    });
+    return out;
+  }
+
+  // 精段: 基準フレーム差分＋サブピクセル重心で [firstIdx,lastIdx] のボール重心列を求める（純粋ロジック）
+  // getPair(i,x0,y0,cw,ch) -> Promise<{base,cur}|null> : 作業座標で切り出した基準/現フレームのグレー（cw×ch）
+  // coarse: [{i,x,y}] 粗段候補（作業座標px。予測位置の初期化・再初期化に使う）
+  // o: {refIdx, width, height, half=40, threshold=60, minPx=4, maxGap=8, firstIdx, lastIdx}
+  // 戻り値 Promise {ok, points:[{i,x,y,n}], missing:[i], refIdx}（points は作業座標。ok は5点以上取れたか）
+  function refineBallPath(getPair, coarse, o){
+    o=o||{};
+    var width=Math.floor(Number(o.width)), height=Math.floor(Number(o.height));
+    var refIdx0=Math.max(0, Math.round(Number(o.refIdx)||0));
+    if(!(width>0) || !(height>0) || typeof getPair!=='function'){
+      return Promise.resolve({ok:false, reason:'bad-args', points:[], missing:[], refIdx:refIdx0});
+    }
+    var half=Math.max(2, Math.floor(Number(o.half)||FINE_HALF));
+    var thr=(typeof o.threshold==='number' && isFinite(o.threshold)) ? o.threshold : FINE_DIFF_THR;
+    var minPx=(typeof o.minPx==='number' && o.minPx>0) ? Math.floor(o.minPx) : FINE_MIN_PX;
+    var maxGap=(typeof o.maxGap==='number' && o.maxGap>0) ? o.maxGap : FINE_MAX_GAP;
+    var fi0=Math.max(0, Math.round(Number(o.firstIdx)||0));
+    var fi1=Math.max(fi0, Math.round(Number(o.lastIdx)||0));
+    var sorted=(coarse||[]).filter(function(c){ return c && isFinite(c.i) && isFinite(c.x) && isFinite(c.y); })
+                          .sort(function(a,b){ return a.i-b.i; });
+    var byI={};
+    sorted.forEach(function(c){ byI[c.i]=c; });
+    function coarseAt(i){
+      if(byI[i]) return byI[i];
+      for(var k=sorted.length-1;k>=0;k--){ if(sorted[k].i<=i) return sorted[k]; }
+      return sorted.length ? sorted[0] : null;
+    }
+    // 等速外挿の初期速度は粗段候補の両端から
+    var vel={x:0, y:0};
+    if(sorted.length>=2){
+      var a0=sorted[0], a1=sorted[sorted.length-1], di=Math.max(1, a1.i-a0.i);
+      vel={x:(a1.x-a0.x)/di, y:(a1.y-a0.y)/di};
+    }
+    var points=[], missing=[], last=null;
+    function step(i){
+      if(i>fi1) return {ok:points.length>=5, points:points, missing:missing, refIdx:refIdx0};
+      // 予測位置 = 粗段軌跡（未ロック時）または 前回重心＋等速外挿（ロック時。粗段と矛盾しない範囲で粗段も混合）
+      var pred;
+      if(last && (i-last.i)<=maxGap){
+        pred={x:last.x+vel.x*(i-last.i), y:last.y+vel.y*(i-last.i)};
+        var cc=coarseAt(i);
+        if(cc){
+          var ddx=pred.x-cc.x, ddy=pred.y-cc.y;
+          if(ddx*ddx+ddy*ddy<=half*half){ pred.x=0.5*pred.x+0.5*cc.x; pred.y=0.5*pred.y+0.5*cc.y; }
+        }
+      }else{
+        var c0=coarseAt(i);
+        if(c0) pred={x:c0.x, y:c0.y};
+        else if(last) pred={x:last.x+vel.x*(i-last.i), y:last.y+vel.y*(i-last.i)};
+        else pred={x:width/2, y:height/2};
+      }
+      // 切り出しは予測位置±half に絞る（画像端では切り詰める）
+      var x0=Math.max(0, Math.round(pred.x-half)), y0=Math.max(0, Math.round(pred.y-half));
+      var x1=Math.min(width-1, Math.ceil(pred.x+half)), y1=Math.min(height-1, Math.ceil(pred.y+half));
+      var cw=x1-x0+1, ch=y1-y0+1;
+      if(cw<3 || ch<3){ missing.push(i); return Promise.resolve(step(i+1)); }
+      return Promise.resolve().then(function(){ return getPair(i, x0, y0, cw, ch); }).then(function(pair){
+        var c=null;
+        if(pair && pair.base && pair.cur && pair.base.length>=cw*ch && pair.cur.length>=cw*ch){
+          c=centroidFromCrop(pair.base, pair.cur, cw, ch, x0, y0, thr);
+        }
+        if(c && c.n>=minPx){
+          points.push({i:i, x:c.x, y:c.y, n:c.n});
+          if(last && i>last.i){ vel={x:(c.x-last.x)/(i-last.i), y:(c.y-last.y)/(i-last.i)}; }
+          last={i:i, x:c.x, y:c.y};
+        }else{
+          missing.push(i); // 精段失敗フレームは欠落扱い（品質ゲートに委ねる）
+        }
+        return step(i+1);
+      }, function(){ missing.push(i); return step(i+1); });
+    }
+    return Promise.resolve(step(fi0));
+  }
+
+  // 二段抽出パイプライン全体（純粋ロジック。フレーム取得は呼び出し側が用意したアクセサに委譲）
+  // o = {
+  //   getFrame(i,tw,th) -> Promise<RGBA配列|null>,        // 粗段スキャン用（全面を tw×th で取得）
+  //   getPair(i,x0,y0,cw,ch,ctx) -> Promise<{base,cur}|null>, // 精段切り出し用（作業座標cropの基準/現グレー。ctx={Ww,Wh,s,refIdx}）
+  //   width, height,                                       // 動画の実解像度
+  //   releaseIdx, arrivalIdx, fps, frameTimes?, totalFrames?,
+  //   scanW=64, scanH=36, enableFine=true,
+  //   fineMaxW=1280, fineHalf=40, fineThr=60, fineMinPx=4, maxGap=8, quietSec=0.5,
+  //   diffThr=18, minPx=3, searchR=9, motionMin=0.3, bandHalf=10
+  // }
+  // 戻り値 Promise {mode:'fine'|'coarse', samples, coarseSamples, points, missing, refIdx, fi0, fi1, scale}（samplesは実映像pxの {t,xPx,yPx} 列）
+  // 精段全体が失敗した場合は mode:'coarse' で粗段のみ（従来動作）にフォールバックする
+  function extractBallPathStaged(o){
+    o=o||{};
+    var vw=Math.floor(Number(o.width)), vh=Math.floor(Number(o.height));
+    var base={mode:'coarse', samples:[], coarseSamples:[], points:[], missing:[], refIdx:0, fi0:0, fi1:0, scale:null, error:null};
+    if(!(vw>0) || !(vh>0) || typeof o.getFrame!=='function'){
+      base.error='bad-args'; return Promise.resolve(base);
+    }
+    var fps=(typeof o.fps==='number' && o.fps>0) ? o.fps : 240;
+    var ft=(o.frameTimes && o.frameTimes.length) ? o.frameTimes : null;
+    var total=(ft && ft.length) ? ft.length : (Math.floor(Number(o.totalFrames))||0);
+    var tOf= ft ? function(i){ return ft[Math.max(0, Math.min(ft.length-1, i))]; } : function(i){ return i/fps; };
+    var fi0=Math.max(0, Math.round(Number(o.releaseIdx)||0));
+    var fi1= total>0 ? Math.min(Math.round(Number(o.arrivalIdx)||0), Math.max(fi0+1, total-1))
+                     : Math.max(fi0+1, Math.round(Number(o.arrivalIdx)||0));
+    base.fi0=fi0; base.fi1=fi1;
+    var scanW=Math.max(8, Math.floor(Number(o.scanW)||64));
+    var scanH=Math.max(8, Math.floor(Number(o.scanH)||36));
+    var scaleX=vw/scanW, scaleY=vh/scanH;
+    var s=Math.min(1, (Number(o.fineMaxW)||FINE_MAX_W)/vw); // 精段の作業スケール（幅1280相当が上限）
+    var Ww=Math.max(scanW, Math.round(vw*s)), Wh=Math.max(scanH, Math.round(vh*s));
+    base.scale={s:s, Ww:Ww, Wh:Wh, scaleX:scaleX, scaleY:scaleY, scanW:scanW, scanH:scanH};
+    var diffThr=(typeof o.diffThr==='number')?o.diffThr:TRAJ_DIFF_THR;
+    var minPx=(typeof o.minPx==='number')?o.minPx:TRAJ_MIN_PX;
+    var searchR=(typeof o.searchR==='number')?o.searchR:TRAJ_SEARCH_R;
+    var motionMin=(typeof o.motionMin==='number')?o.motionMin:TRAJ_MOTION_MIN;
+    var bandHalf=(typeof o.bandHalf==='number')?o.bandHalf:TRAJ_BAND_HALF;
+    var quietSec=(typeof o.quietSec==='number' && o.quietSec>0)?o.quietSec:QUIET_SEC;
+    var quiet=Math.min(fi0, Math.round(quietSec*fps));
+    var lo=Math.max(0, fi0-quiet);
+    var enableFine=(o.enableFine!==false);
+    // --- 粗段: [lo, fi1] を scanW×scanH で走査（[lo, fi0-1] は基準フレーム選択用の動き量取得） ---
+    var motion=new Float64Array(fi1+1);
+    var cands=[], last=null, vel={x:0, y:0};
+    function scanLoop(i, prev){
+      if(i>fi1){
+        base.refIdx=pickQuietFrame(motion, lo, Math.max(lo, fi0-1)); // リリース前の静止フレームを基準に
+        base.coarseSamples=buildTrajSamples(cands, tOf, scaleX, scaleY, bandHalf);
+        base.samples=base.coarseSamples;
+        return Promise.resolve(base);
+      }
+      return Promise.resolve().then(function(){ return o.getFrame(i, scanW, scanH); }).then(function(rgba){
+        if(!rgba || rgba.length<scanW*scanH*4){ motion[i]=0; return scanLoop(i+1, null); }
+        var gray=toGray(rgba);
+        var m=prev ? motionMetric(prev.rgba, rgba, scanW, scanH) : 0;
+        motion[i]=m;
+        if(i>=fi0 && prev && m>=motionMin){
+          // 探索窓は前候補位置＋等速外挿で絞る（初回は全画面）
+          var ctr=last ? {x:last.x+vel.x, y:last.y+vel.y} : {x:scanW/2, y:scanH/2};
+          var r=last ? searchR : Math.max(scanW, scanH)/2;
+          var blob=blobCentroid(prev.gray, gray, ctr.x, ctr.y, r, scanW, scanH, diffThr);
+          if(blob && blob.n>=minPx && (!last || blob.x>=last.x-0.5)){ // x方向に単調に進む候補のみ採用
+            if(last) vel={x:blob.x-last.x, y:blob.y-last.y};
+            last=blob;
+            cands.push({i:i, x:blob.x, y:blob.y});
+          }
+        }
+        return scanLoop(i+1, {rgba:rgba, gray:gray});
+      }, function(){ motion[i]=0; return scanLoop(i+1, null); });
+    }
+    // lo の動き量だけは lo-1 との差分で埋めるため先頭1フレームを先読みする
+    var head= lo>0
+      ? Promise.resolve().then(function(){ return o.getFrame(lo-1, scanW, scanH); }).then(function(rgba){
+          return (rgba && rgba.length>=scanW*scanH*4) ? {rgba:rgba, gray:toGray(rgba)} : null;
+        }, function(){ return null; })
+      : Promise.resolve(null);
+    return head.then(function(prev0){
+      return scanLoop(lo, prev0);
+    }).then(function(b){
+      if(!enableFine || typeof o.getPair!=='function') return b;
+      // --- 精段: リリース〜到達区間のみ、各フレームを予測位置±half の切り出しで基準フレーム差分 ---
+      var ctx={Ww:Ww, Wh:Wh, s:s, refIdx:b.refIdx};
+      var getPair=function(i, x0, y0, cw, ch){ return o.getPair(i, x0, y0, cw, ch, ctx); };
+      var coarseWork=cands.map(function(c){ return {i:c.i, x:c.x*scaleX*s, y:c.y*scaleY*s}; });
+      return refineBallPath(getPair, coarseWork, {
+        refIdx:b.refIdx, width:Ww, height:Wh,
+        half:o.fineHalf, threshold:o.fineThr, minPx:o.fineMinPx, maxGap:o.maxGap,
+        firstIdx:fi0, lastIdx:fi1
+      }).then(function(r){
+        b.points=r.points||[]; b.missing=r.missing||[];
+        if(r.refIdx!=null) b.refIdx=r.refIdx;
+        if(r.ok && b.points.length>=5){
+          var fineCands=b.points.map(function(p){ return {i:p.i, x:p.x/(scaleX*s), y:p.y/(scaleY*s)}; });
+          var fineSamples=buildTrajSamples(fineCands, tOf, scaleX, scaleY, bandHalf);
+          if(fineSamples.length>=5){ b.mode='fine'; b.samples=fineSamples; }
+        }
+        return b;
+      });
+    });
+  }
+
   return {
     SAMPLE_MS:SAMPLE_MS, TRIG_MIN:TRIG_MIN, TRIG_RATIO:TRIG_RATIO, TRIG_STREAK:TRIG_STREAK,
     QUIET_ABS:QUIET_ABS, QUIET_RATIO:QUIET_RATIO, QUIET_MS:QUIET_MS, MAX_REC_MS:MAX_REC_MS, ARM_MS:ARM_MS,
@@ -1754,7 +2058,14 @@ var KYU=(function(){
     pxPerMeter:pxPerMeter, releaseAdvanceM:releaseAdvanceM, letterboxRect:letterboxRect,
     clientToVideoPx:clientToVideoPx, videoPxToPercent:videoPxToPercent, speechTextForKmh:speechTextForKmh,
     fitFlightPath:fitFlightPath, flightQualityGate:flightQualityGate,
-    ivbFromFit:ivbFromFit, plateSpeedFromInitial:plateSpeedFromInitial, K_DRAG:K_DRAG
+    ivbFromFit:ivbFromFit, plateSpeedFromInitial:plateSpeedFromInitial, K_DRAG:K_DRAG,
+    TRAJ_DIFF_THR:TRAJ_DIFF_THR, TRAJ_MIN_PX:TRAJ_MIN_PX, TRAJ_SEARCH_R:TRAJ_SEARCH_R,
+    TRAJ_BAND_HALF:TRAJ_BAND_HALF, TRAJ_MOTION_MIN:TRAJ_MOTION_MIN,
+    FINE_MAX_W:FINE_MAX_W, FINE_HALF:FINE_HALF, FINE_DIFF_THR:FINE_DIFF_THR,
+    FINE_MIN_PX:FINE_MIN_PX, FINE_MAX_GAP:FINE_MAX_GAP, QUIET_SEC:QUIET_SEC,
+    centroidFromDiff:centroidFromDiff, centroidFromCrop:centroidFromCrop, centroidAround:centroidAround,
+    pickQuietFrame:pickQuietFrame, blobCentroid:blobCentroid, buildTrajSamples:buildTrajSamples,
+    refineBallPath:refineBallPath, extractBallPathStaged:extractBallPathStaged
   };
 })();
 if(typeof module!=='undefined' && module.exports){ module.exports=KYU; }
@@ -2244,8 +2555,8 @@ function resultPanelHTML(r, excludeId){
   var ivb=state.lastIvb;
   var ivbOk=(ivb && ivb.pass && typeof ivb.ivbCm==='number' && isFinite(ivb.ivbCm));
   var ivbVal=ivbOk ? '+'+ivb.ivbCm.toFixed(1)+' cm' : '—';
-  var ivbSub=ivbOk ? '軌道抽出 '+ivb.nUsed+'/'+ivb.nTotal+'点・ゲート合格'
-            : (ivb && ivb.reasons && ivb.reasons.length) ? 'ゲート不合格: '+ivb.reasons.join('、')
+  var ivbSub=ivbOk ? '軌道抽出 '+ivb.nUsed+'/'+ivb.nTotal+'点・ゲート合格'+(ivb.mode && ivb.mode!=='fine' ? '・低解像度抽出（フォールバック）' : '')
+            : (ivb && ivb.reasons && ivb.reasons.length) ? 'ゲート不合格: '+ivb.reasons.join('、')+(ivb.mode && ivb.mode!=='fine' ? '・低解像度抽出（フォールバック）' : '')
             : '軌道抽出未実行（実験）';
   // 終速（推定）タイルと減衰率タイル（初速×e^(−kD) とその減衰率%）
   var plateKmh=(typeof r.plateKmh==='number' && isFinite(r.plateKmh)) ? r.plateKmh : null;
@@ -3416,49 +3727,24 @@ function renderCalibMarkers(){
    フレーム時刻は state.frameTimes（MP4サンプルテーブル）を優先。
    pxPerMeter はタップ校正の値があればそれを使い、無ければ「未校正」と明示して変化量は出さない。
    抽出できたら ivbFromFit + flightQualityGate を実行し、合格時のみ結果パネルに縦変化量を表示する。 */
-var TRAJ_DIFF_THR=18;   // グレースケール差分のしきい値
-var TRAJ_MIN_PX=3;       // 候補とみなす最小変化ピクセル数
-var TRAJ_SEARCH_R=9;     // 探索窓の半径（スキャン座標px。初回は全画面）
-var TRAJ_BAND_HALF=10;   // 帯状ROIの半幅（スキャン座標px）
-var TRAJ_MOTION_MIN=0.3; // フレーム間動き量の下限（motionMetric の 0-255 スケール換算）
+var TRAJ_DIFF_THR=KYU.TRAJ_DIFF_THR;   // グレースケール差分のしきい値（KYU純粋ブロックが単一ソース）
+var TRAJ_MIN_PX=KYU.TRAJ_MIN_PX;       // 候補とみなす最小変化ピクセル数
+var TRAJ_SEARCH_R=KYU.TRAJ_SEARCH_R;   // 探索窓の半径（スキャン座標px。初回は全画面）
+var TRAJ_BAND_HALF=KYU.TRAJ_BAND_HALF; // 帯状ROIの半幅（スキャン座標px）
+var TRAJ_MOTION_MIN=KYU.TRAJ_MOTION_MIN; // フレーム間動き量の下限（motionMetric の 0-255 スケール換算）
+// 精段（二段抽出の高解像度段）の既定値
+var FINE_MAX_W=KYU.FINE_MAX_W;   // 精段の作業解像度の幅上限（この幅相当まで原寸で切り出す）
+var FINE_HALF=KYU.FINE_HALF;     // 精段の切り出し半サイズ（作業px。予測位置±この値）
+var FINE_DIFF_THR=KYU.FINE_DIFF_THR; // 精段の基準フレーム差分しきい値
+var FINE_MIN_PX=KYU.FINE_MIN_PX; // 精段で採用する最小ブロブピクセル数
+var QUIET_SEC=KYU.QUIET_SEC;     // 基準フレーム探索のためリリース前に遡る秒数
 var trajEls=null;
-// 探索窓内で |grayB-grayA|>thr のピクセルの重心（差分量で重み付け）を返す。無ければ null
-function blobCentroid(grayA, grayB, cx, cy, r, w, h, thr){
-  var x0=Math.max(0, Math.floor(cx-r)), x1=Math.min(w-1, Math.ceil(cx+r));
-  var y0=Math.max(0, Math.floor(cy-r)), y1=Math.min(h-1, Math.ceil(cy+r));
-  var sw=0, sx=0, sy=0, n=0, x, y, d;
-  for(y=y0;y<=y1;y++){
-    for(x=x0;x<=x1;x++){
-      d=grayB[y*w+x]-grayA[y*w+x];
-      if(d<0) d=-d;
-      if(d>thr){ sw+=d; sx+=d*x; sy+=d*y; n++; }
-    }
-  }
-  if(!n || !sw) return null;
-  return {x:sx/sw, y:sy/sw, n:n};
-}
+// 探索窓内で |grayB-grayA|>thr のピクセルの重心（差分量で重み付け）を返す。無ければ null（実体はKYUに移動）
+var blobCentroid=KYU.blobCentroid;
 // 候補列を帯状ROI（先頭候補=リリース位置〜末尾候補=到達位置を結ぶ線分からの垂直距離）と
-// x単調性で絞り込み、スキャン座標→実映像pxに変換して {t,xPx,yPx} 列を返す
+// x単調性で絞り込み、スキャン座標→実映像pxに変換して {t,xPx,yPx} 列を返す（実体はKYUに移動）
 function buildTrajSamples(cands, tOf, scaleX, scaleY){
-  var mapOne=function(c){ return {t:tOf(c.i), xPx:c.x*scaleX, yPx:c.y*scaleY}; };
-  if(!cands || !cands.length) return [];
-  if(cands.length<2) return [mapOne(cands[0])];
-  var p0=cands[0], p1=cands[cands.length-1];
-  var dx=p1.x-p0.x, dy=p1.y-p0.y, len2=dx*dx+dy*dy;
-  var kept=cands;
-  if(len2>1e-9){
-    var len=Math.sqrt(len2);
-    kept=cands.filter(function(c){
-      var d=Math.abs(dy*(c.x-p0.x)-dx*(c.y-p0.y))/len; // 点と線分の垂直距離
-      return d<=TRAJ_BAND_HALF;
-    });
-    if(kept.length<2) kept=cands;
-  }
-  var out=[], lastX=-1e12;
-  kept.forEach(function(c){
-    if(c.x>=lastX-1e-9){ out.push(mapOne(c)); lastX=c.x; } // x方向に単調に進む候補だけ繋ぐ
-  });
-  return out;
+  return KYU.buildTrajSamples(cands, tOf, scaleX, scaleY, TRAJ_BAND_HALF);
 }
 // リリース〜到達フレーム区間を走査してボール候補列 {t,xPx,yPx} を返す（Promise）。失敗時 reject
 function extractBallPath(v, o){
@@ -3507,6 +3793,70 @@ function extractBallPath(v, o){
     }catch(e){ rej(e); }
   });
 }
+// 二段抽出（高解像度化）: 動画要素をアクセサで包み、純粋ロジック KYU.extractBallPathStaged へ委譲する
+// 粗段: 64×36スキャン（既存キャンバス相当の全面描画）でリリース〜到達の大まかな軌跡と基準フレームを決める
+// 精段: 各フレームを予測位置±FINE_HALF の切り出しだけ原寸（幅FINE_MAX_W相当まで）で読み、
+//       投球前の静止基準フレームとの差分のサブピクセル重心を取る（getPair が基準/現の切り出しグレーを返す）
+// 戻り値 Promise は KYU.extractBallPathStaged の結果 {mode:'fine'|'coarse', samples, ...}
+function extractBallPathStagedVideo(v, o){
+  var vw=v.videoWidth||o.width||0, vh=v.videoHeight||o.height||0;
+  var fps=o.fps||state.fps;
+  var ft=(o.frameTimes && o.frameTimes.length) ? o.frameTimes : null;
+  var tOf=function(i){ return ft ? ft[Math.max(0, Math.min(ft.length-1, i))] : i/fps; };
+  var s=Math.min(1, FINE_MAX_W/((vw>0)?vw:FINE_MAX_W));
+  var Ww=Math.max(SCAN_W, Math.round(vw*s)), Wh=Math.max(SCAN_H, Math.round(vh*s));
+  var frameCanvas=null, frameCtx=null;   // 粗段スキャン用（scanW×scanH）
+  var cropCanvas=null, cropCtx=null;     // 精段切り出し用（呼び出しごとにリサイズ）
+  var refGrayFull=null, refLoadedFor=-1; // 基準フレームの作業解像度グレー（一度だけ取得して使い回す）
+  function getFrame(i, tw, th){
+    return seekVideo(v, tOf(i)).then(function(){
+      if(!frameCanvas){ frameCanvas=document.createElement('canvas'); frameCtx=frameCanvas.getContext('2d',{willReadFrequently:true}); }
+      if(frameCanvas.width!==tw || frameCanvas.height!==th){ frameCanvas.width=tw; frameCanvas.height=th; }
+      try{ frameCtx.drawImage(v,0,0,vw,vh,0,0,tw,th); }catch(e){ return null; }
+      try{ return frameCtx.getImageData(0,0,tw,th).data; }catch(e){ return null; }
+    });
+  }
+  function ensureRef(refIdx){
+    if(refGrayFull && refLoadedFor===refIdx) return Promise.resolve(refGrayFull);
+    return seekVideo(v, tOf(refIdx)).then(function(){
+      if(!frameCanvas){ frameCanvas=document.createElement('canvas'); frameCtx=frameCanvas.getContext('2d',{willReadFrequently:true}); }
+      if(frameCanvas.width!==Ww || frameCanvas.height!==Wh){ frameCanvas.width=Ww; frameCanvas.height=Wh; }
+      frameCtx.drawImage(v,0,0,vw,vh,0,0,Ww,Wh);
+      refGrayFull=KYU.toGray(frameCtx.getImageData(0,0,Ww,Wh).data);
+      refLoadedFor=refIdx;
+      return refGrayFull;
+    });
+  }
+  function getPair(i, x0, y0, cw, ch, ctx){
+    return ensureRef(ctx.refIdx).then(function(){
+      return seekVideo(v, tOf(i)).then(function(){
+        if(!cropCanvas){ cropCanvas=document.createElement('canvas'); cropCtx=cropCanvas.getContext('2d',{willReadFrequently:true}); }
+        if(cropCanvas.width!==cw || cropCanvas.height!==ch){ cropCanvas.width=cw; cropCanvas.height=ch; }
+        try{
+          // 切り出し元は動画の実解像度（作業スケール s で逆変換した矩形）
+          cropCtx.drawImage(v, x0/ctx.s, y0/ctx.s, cw/ctx.s, ch/ctx.s, 0, 0, cw, ch);
+        }catch(e){ return null; }
+        var cur, base=new Uint8Array(cw*ch), x, y;
+        try{ cur=KYU.toGray(cropCtx.getImageData(0,0,cw,ch).data); }catch(e){ return null; }
+        for(y=0;y<ch;y++){
+          var rs=(y0+y)*ctx.Ww+x0, rd=y*cw;
+          for(x=0;x<cw;x++){ base[rd+x]=refGrayFull[rs+x]; }
+        }
+        return {base:base, cur:cur};
+      });
+    });
+  }
+  return KYU.extractBallPathStaged({
+    getFrame:getFrame, getPair:getPair, width:vw, height:vh,
+    releaseIdx:o.releaseIdx, arrivalIdx:o.arrivalIdx,
+    frameTimes:ft, fps:fps, totalFrames:totalFrames(),
+    scanW:SCAN_W, scanH:SCAN_H, enableFine:true,
+    fineMaxW:FINE_MAX_W, fineHalf:FINE_HALF, fineThr:FINE_DIFF_THR, fineMinPx:FINE_MIN_PX,
+    maxGap:KYU.FINE_MAX_GAP, quietSec:QUIET_SEC,
+    diffThr:TRAJ_DIFF_THR, minPx:TRAJ_MIN_PX, searchR:TRAJ_SEARCH_R,
+    motionMin:TRAJ_MOTION_MIN, bandHalf:TRAJ_BAND_HALF
+  });
+}
 function buildTrajUI(){
   if(trajEls) return;
   var card=document.createElement('div');
@@ -3548,33 +3898,45 @@ function runTrajectoryExtraction(){
   var fi0=hasFT ? KYU.frameIndexAt(state.frameTimes, ws) : Math.round(ws*state.fps);
   var fi1=hasFT ? KYU.frameIndexAt(state.frameTimes, we) : Math.round(we*state.fps);
   var fpsEff=KYU.fpsFromFrameTimes(state.frameTimes)||state.fps;
-  trajStatus('軌道抽出中…（F'+pad(fi0,4)+'〜F'+pad(fi1,4)+' を走査）');
+  trajStatus('軌道抽出中…（二段抽出 F'+pad(fi0,4)+'〜F'+pad(fi1,4)+' を走査）');
   trajEls.start.disabled=true;
-  return extractBallPath(v, {releaseIdx:fi0, arrivalIdx:fi1, frameTimes:state.frameTimes, fps:fpsEff}).then(function(samples){
+  var opts={releaseIdx:fi0, arrivalIdx:fi1, frameTimes:state.frameTimes, fps:fpsEff,
+            width:v.videoWidth||0, height:v.videoHeight||0};
+  // 二段抽出パイプライン（粗段64×36スキャン＋精段基準フレーム差分サブピクセル重心）を呼ぶ。
+  // 呼び出し自体が失敗した場合のみ、従来の extractBallPath（粗段のみ）にフォールバックする
+  return extractBallPathStagedVideo(v, opts).then(function(staged){
+    return {mode:(staged && staged.mode) || 'coarse', samples:(staged && staged.samples) || []};
+  }, function(){
+    return extractBallPath(v, opts).then(function(samples){ return {mode:'coarse', samples:samples||[]}; });
+  }).then(function(r){
+    var samples=r.samples, mode=r.mode;
+    // 精段が全失敗した場合は粗段のみ（従来相当）にフォールバックしている → UIへ明示する
+    var fallback=(mode!=='fine');
+    var fbLabel=fallback ? '低解像度抽出（フォールバック）・' : '';
     trajEls.start.disabled=false;
     if(!samples || samples.length<5){
       state.lastIvb=null;
-      trajStatus('ボール候補を抽出できませんでした（検出 '+((samples&&samples.length)||0)+' 点）。マーク位置をコマ送りで調整して再実行してください。');
+      trajStatus(fbLabel+'ボール候補を抽出できませんでした（検出 '+((samples&&samples.length)||0)+' 点）。マーク位置をコマ送りで調整して再実行してください。');
       updateResult();
       return null;
     }
     var res=KYU.ivbFromFit(samples, {pxPerMeter:ppm, fps:fpsEff, windowStart:ws, windowEnd:we});
     if(!res || !res.fit){
       state.lastIvb=null;
-      trajStatus('軌道フィットに失敗しました（検出 '+samples.length+' 点）');
+      trajStatus(fbLabel+'軌道フィットに失敗しました（検出 '+samples.length+' 点）');
       updateResult();
       return null;
     }
     var gate=KYU.flightQualityGate(res.fit);
     if(gate.pass){
-      state.lastIvb={pass:true, ivbCm:res.ivbCm, nUsed:res.fit.nUsed, nTotal:res.fit.nTotal,
+      state.lastIvb={pass:true, mode:mode, ivbCm:res.ivbCm, nUsed:res.fit.nUsed, nTotal:res.fit.nTotal,
                      rmsePx:res.fit.rmsePx, coverage:res.fit.coverage, window:{start:ws, end:we}};
-      trajStatus('抽出 '+res.fit.nUsed+'/'+res.fit.nTotal+' 点（カバー率 front/mid/back '+
+      trajStatus(fbLabel+'抽出 '+res.fit.nUsed+'/'+res.fit.nTotal+' 点（カバー率 front/mid/back '+
         res.fit.coverage.front.toFixed(2)+'/'+res.fit.coverage.mid.toFixed(2)+'/'+res.fit.coverage.back.toFixed(2)+
         ' ・ RMSE '+res.fit.rmsePx.toFixed(2)+'px）→ ゲート合格。縦変化量 +'+res.ivbCm.toFixed(1)+' cm（実験表示）');
     }else{
-      state.lastIvb={pass:false, ivbCm:null, reasons:gate.reasons, window:{start:ws, end:we}};
-      trajStatus('ゲート不合格のため縦変化量は表示しません: '+gate.reasons.join('、')+'（抽出 '+res.fit.nUsed+'/'+res.fit.nTotal+' 点）');
+      state.lastIvb={pass:false, mode:mode, ivbCm:null, reasons:gate.reasons, window:{start:ws, end:we}};
+      trajStatus(fbLabel+'ゲート不合格のため縦変化量は表示しません: '+gate.reasons.join('、')+'（抽出 '+res.fit.nUsed+'/'+res.fit.nTotal+' 点）');
     }
     updateResult();
     return state.lastIvb;
@@ -3634,6 +3996,7 @@ if(typeof module!=='undefined' && module.exports){
     resultPanelHTML:resultPanelHTML, tile:tile, dayStats:dayStats, dispKmh:dispKmh, markText:markText,
     currentPxPerMeter:currentPxPerMeter, updateMarks:updateMarks,
     blobCentroid:blobCentroid, buildTrajSamples:buildTrajSamples, extractBallPath:extractBallPath,
+    extractBallPathStagedVideo:extractBallPathStagedVideo,
     buildTrajUI:buildTrajUI, updateTrajUI:updateTrajUI, runTrajectoryExtraction:runTrajectoryExtraction,
     trajEls:function(){ return trajEls; }
   };
