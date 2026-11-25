@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.7 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.8 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -1471,6 +1471,272 @@ var KYU=(function(){
     return Math.round(v)+'キロ';
   }
 
+  /* ---- Phase 3: ボール軌道フィット（真横映像の重心列 → マグヌス力による縦変化量） ---- */
+
+  // 3x3連立方程式を部分ピボット付きガウス消去で解く。特異なら null
+  function solve3(A,b){
+    var m=[[A[0][0],A[0][1],A[0][2],b[0]],
+           [A[1][0],A[1][1],A[1][2],b[1]],
+           [A[2][0],A[2][1],A[2][2],b[2]]];
+    var i,j,k;
+    for(k=0;k<3;k++){
+      var p=k;
+      for(i=k+1;i<3;i++){ if(Math.abs(m[i][k])>Math.abs(m[p][k])) p=i; }
+      if(!(Math.abs(m[p][k])>1e-12)) return null;
+      if(p!==k){ var tmp=m[p]; m[p]=m[k]; m[k]=tmp; }
+      for(i=k+1;i<3;i++){
+        var f=m[i][k]/m[k][k];
+        for(j=k;j<4;j++){ m[i][j]-=f*m[k][j]; }
+      }
+    }
+    var x=[0,0,0];
+    for(i=2;i>=0;i--){
+      var s=m[i][3];
+      for(j=i+1;j<3;j++){ s-=m[i][j]*x[j]; }
+      x[i]=s/m[i][i];
+    }
+    return x;
+  }
+
+  // y = c0 + c1*tc + c2*tc^2 の最小二乗フィット。points=[{tc,y}]（tcは時刻オフセット済み）。
+  // 時刻シフトは {1,t,t^2} の張る空間を変えないので c2 はシフト不変。3点未満・特異なら null
+  function fitParabola(points){
+    var n=points.length;
+    if(n<3) return null;
+    var s0=0,s1=0,s2=0,s3=0,s4=0,b0=0,b1=0,b2=0,i,t,y;
+    for(i=0;i<n;i++){
+      t=points[i].tc; y=points[i].y;
+      s0+=1; s1+=t; s2+=t*t; s3+=t*t*t; s4+=t*t*t*t;
+      b0+=y; b1+=t*y; b2+=t*t*y;
+    }
+    var c=solve3([[s0,s1,s2],[s1,s2,s3],[s2,s3,s4]],[b0,b1,b2]);
+    if(!c) return null;
+    return {c0:c[0], c1:c[1], c2:c[2]};
+  }
+
+  // 飛行軌道フィット。samples=[{t(秒), xPx, yPx}]（真横映像のボール重心列）、opts={pxPerMeter, g=9.80665, fps, windowStart, windowEnd}
+  // yPx をメートルに変換し上下を実世界向き（上向き正）に直してから y(t)=c0+c1*t+c2*t^2 を最小二乗でフィットし、
+  // 残差2.5σ超の外れ値を除外して再フィット（最大3回）を行う。
+  // 上向き正の座標系で y''=aMagnus-g=2*c2 なので aMagnus=2*c2+g。ホップ量 hopM=0.5*aMagnus*Tfl^2。
+  //   Tfl は opts.windowStart/windowEnd（リリース時刻・到達時刻）があれば windowEnd-windowStart（飛行時間）、
+  //   無ければ従来どおり T=サンプル最終時刻（後方互換）。
+  // coverage は飛行区間を3等分した各区間の「期待フレーム数に対する実サンプル数の比」（期待値は opts.fps、無ければサンプル間隔中央値から推定）。
+  //   windowStart/windowEnd があればその固定区間を3等分して計算する（残サンプル範囲だと末尾欠損が過小評価されるため）。
+  //   無ければ従来どおり残サンプルの時刻範囲 [t0, T] で計算する（後方互換）。
+  // 入力不足（点5未満・時刻非単調・pxPerMeter不正など）なら null
+  function fitFlightPath(samples, opts){
+    opts=opts||{};
+    var g=(typeof opts.g==='number' && isFinite(opts.g) && opts.g>0)?opts.g:9.80665;
+    var ppm=Number(opts.pxPerMeter);
+    if(!isFinite(ppm) || ppm<=0) return null;
+    if(!samples || !Array.isArray(samples) || samples.length<5) return null;
+    var n=samples.length, i;
+    var t=new Array(n), y=new Array(n), x=new Array(n);
+    for(i=0;i<n;i++){
+      var s=samples[i];
+      if(!s) return null;
+      var tt=Number(s.t), xp=Number(s.xPx), yp=Number(s.yPx);
+      if(!isFinite(tt) || !isFinite(xp) || !isFinite(yp)) return null;
+      if(i>0 && !(tt>t[i-1])) return null; // 時刻は単調増加
+      t[i]=tt;
+      y[i]=-yp/ppm; // 画像座標は下向き正 → 上向き正へ（定数オフセットは c0 に吸収されるので符号反転のみでよい）
+      x[i]=xp/ppm;  // x は実世界の進行方向[m]（符号反転なし）
+    }
+    var t0=t[0], T=t[n-1], tMid=(t0+T)/2;
+    // 固定カバー率窓（Phase 3-B）: リリース時刻・到達時刻が渡された場合はその区間をカバー率計算に使う
+    var ws=(typeof opts.windowStart==='number' && isFinite(opts.windowStart)) ? opts.windowStart : null;
+    var we=(typeof opts.windowEnd==='number' && isFinite(opts.windowEnd)) ? opts.windowEnd : null;
+    var hasWin=(ws!=null && we!=null && we>ws);
+    // fps: opts.fps が無ければサンプル間隔の中央値から推定
+    var fps=(typeof opts.fps==='number' && isFinite(opts.fps) && opts.fps>0)?opts.fps:null;
+    if(!fps){
+      var d=new Array(n-1);
+      for(i=1;i<n;i++){ d[i-1]=t[i]-t[i-1]; }
+      d.sort(function(a,b){ return a-b; });
+      var md=d[Math.floor(d.length/2)];
+      if(!(md>0) || !isFinite(md)) return null;
+      fps=1/md;
+    }
+    // フィット + 外れ値除去（初回フィット後に残差2.5σ超を除外して再フィット、最大3回）
+    var mask=new Array(n), iter, pts, fit=null;
+    for(i=0;i<n;i++){ mask[i]=true; }
+    for(iter=0; iter<4; iter++){
+      pts=[];
+      for(i=0;i<n;i++){ if(mask[i]) pts.push({tc:t[i]-tMid, y:y[i]}); }
+      if(pts.length<5) break;
+      var f=fitParabola(pts);
+      if(!f) break;
+      fit=f;
+      if(iter===3) break;
+      var s2=0, cnt=0, res=new Array(n);
+      for(i=0;i<n;i++){
+        if(!mask[i]){ res[i]=0; continue; }
+        var tc=t[i]-tMid;
+        var r=y[i]-(f.c0+f.c1*tc+f.c2*tc*tc);
+        res[i]=r; s2+=r*r; cnt++;
+      }
+      var sigma=Math.sqrt(s2/cnt);
+      if(!(sigma>0)) break; // 残差ゼロ（完全一致）ならこれ以上除外しない
+      var nm=new Array(n), removed=0, kept=0;
+      for(i=0;i<n;i++){
+        if(mask[i] && Math.abs(res[i])>2.5*sigma){ nm[i]=false; removed++; }
+        else { nm[i]=mask[i]; if(nm[i]) kept++; }
+      }
+      if(removed===0 || kept<5) break; // 除去で点不足になる場合は現状のフィットを維持
+      mask=nm;
+    }
+    if(!fit) return null;
+    var used=0;
+    for(i=0;i<n;i++){ if(mask[i]) used++; }
+    // x方向のフィットも返す（ivbFromFit の初期状態推定用。y と同じマスクで2次フィット）
+    var xpts=[];
+    for(i=0;i<n;i++){ if(mask[i]) xpts.push({tc:t[i]-tMid, y:x[i]}); }
+    var xCoef=(xpts.length>=3) ? fitParabola(xpts) : null;
+    // マグヌス加速度とホップ量（上向き正: y''=aMagnus-g=2*c2）
+    // ホップ量の T は固定窓があれば windowEnd-windowStart（飛行時間）、無ければ従来どおり T（後方互換）
+    var aMagnus=2*fit.c2+g;
+    var Tfl=hasWin ? (we-ws) : T;
+    var hopM=0.5*aMagnus*Tfl*Tfl;
+    // フィット残差のRMSをpx換算（使用点のみ）
+    var rs2=0, rc=0;
+    for(i=0;i<n;i++){
+      if(!mask[i]) continue;
+      var tc2=t[i]-tMid;
+      var rr=y[i]-(fit.c0+fit.c1*tc2+fit.c2*tc2*tc2);
+      rs2+=rr*rr; rc++;
+    }
+    var rmsePx=Math.sqrt(rs2/rc)*ppm;
+    // 区間別カバー率: 飛行区間を3等分し「期待フレーム数に対する実サンプル数の比」を返す
+    // 固定窓あり: [windowStart, windowEnd] を3等分（窓外のサンプルはカバー率に数えない）
+    // 固定窓なし: 従来どおり残サンプルの時刻範囲 [t0, T]（後方互換）
+    var covStart=hasWin ? ws : t0, covDur=hasWin ? (we-ws) : (T-t0);
+    var seg=covDur/3;
+    var expSeg=seg*fps, expAll=covDur*fps;
+    var cov=[0,0,0], inWin=0;
+    for(i=0;i<n;i++){
+      if(hasWin && (t[i]<ws || t[i]>we)) continue; // 固定窓の外側は数えない
+      var k=Math.floor((t[i]-covStart)/seg);
+      if(k<0) k=0; if(k>2) k=2;
+      cov[k]++; inWin++;
+    }
+    return {
+      aMagnus:aMagnus,
+      hopCm:hopM*100,
+      rmsePx:rmsePx,
+      nUsed:used,
+      nTotal:n,
+      tMid:tMid,
+      coefY:{c0:fit.c0, c1:fit.c1, c2:fit.c2}, // y(t)=c0+c1*(t-tMid)+c2*(t-tMid)^2 [m, 上向き正]
+      coefX:xCoef,                            // x(t) の2次フィット（失敗時 null）
+      window:hasWin ? {start:ws, end:we} : null,
+      coverage:{front:cov[0]/expSeg, mid:cov[1]/expSeg, back:cov[2]/expSeg, overall:inWin/expAll}
+    };
+  }
+
+  // 飛行品質ゲート: 区間別カバー率とフィット残差で軌道推定の信頼性を判定する純粋関数
+  // 既定基準: front/mid/back 各0.30以上、overall 0.60以上、rmsePx 2.0以下（thresholdsで上書き可）
+  // 戻り値 {pass:boolean, reasons:[不足項目の文字列]}
+  function flightQualityGate(metrics, thresholds){
+    var th={front:0.30, mid:0.30, back:0.30, overall:0.60, rmsePx:2.0};
+    if(thresholds && typeof thresholds==='object'){
+      var keys=['front','mid','back','overall','rmsePx'], ki;
+      for(ki=0;ki<keys.length;ki++){
+        var k=keys[ki], v=thresholds[k];
+        if(typeof v==='number' && isFinite(v)) th[k]=v;
+      }
+    }
+    if(!metrics || typeof metrics!=='object' || !metrics.coverage){
+      return {pass:false, reasons:['計測データ不足']};
+    }
+    var c=metrics.coverage, reasons=[];
+    if(!(typeof c.front==='number' && isFinite(c.front) && c.front>=th.front)) reasons.push('front区間カバー率不足');
+    if(!(typeof c.mid==='number' && isFinite(c.mid) && c.mid>=th.mid)) reasons.push('mid区間カバー率不足');
+    if(!(typeof c.back==='number' && isFinite(c.back) && c.back>=th.back)) reasons.push('back区間カバー率不足');
+    if(!(typeof c.overall==='number' && isFinite(c.overall) && c.overall>=th.overall)) reasons.push('全体カバー率不足');
+    var rmse=Number(metrics.rmsePx);
+    if(!(isFinite(rmse) && rmse<=th.rmsePx)) reasons.push('フィット残差超過');
+    return {pass:reasons.length===0, reasons:reasons};
+  }
+
+  // 終速（到達時点の推定速度）: 2次抵抗モデル dv/dt=-k v^2 で距離 D を進むと v = v0*e^{-kD}
+  // （k は初速換算と同じ K_DRAG≈0.00727/m）。例: 初速141.7 km/h・17.32m → 約124.9 km/h。
+  // 戻り値 {plateKmh, decayPct, kD}（decayPct は減衰率% = (1-e^{-kD})*100）。無効入力（非数・0以下）は null
+  function plateSpeedFromInitial(initKmh, distM){
+    var v=Number(initKmh), d=Number(distM);
+    if(!isFinite(v) || !isFinite(d) || v<=0 || d<=0) return null;
+    var kD=K_DRAG*d, r=Math.exp(-kD);
+    return {plateKmh:v*r, decayPct:(1-r)*100, kD:kD};
+  }
+
+  // IVB（縦変化量）の比較軌道方式推定（Phase 3-B）:
+  // fitFlightPath のフィットから windowStart 時点の初期状態 (x,y,vx,vy) を推定し、
+  // (i) 実測フィット軌道と (ii) 同じ初期状態から「重力＋2次空気抵抗のみ（マグヌスなし）」で
+  // RK4積分した比較軌道を、到達 x（x方向の到達点 = windowEnd 時点のフィット x）まで進め、
+  // 到達高さの差を cm で返す。戻り値 {ivbCm, fit}（fit は fitFlightPath の結果）。失敗時 null。
+  function ivbFromFit(samples, opts){
+    opts=opts||{};
+    var fit=fitFlightPath(samples, opts);
+    if(!fit || !fit.coefY) return null;
+    var ppm=Number(opts.pxPerMeter);
+    if(!isFinite(ppm) || ppm<=0) return null;
+    if(!samples || !Array.isArray(samples) || samples.length<5) return null;
+    var g=(typeof opts.g==='number' && isFinite(opts.g) && opts.g>0)?opts.g:9.80665;
+    var n=samples.length;
+    var ws=(typeof opts.windowStart==='number' && isFinite(opts.windowStart)) ? opts.windowStart : Number(samples[0].t);
+    var we=(typeof opts.windowEnd==='number' && isFinite(opts.windowEnd)) ? opts.windowEnd : Number(samples[n-1].t);
+    if(!(we>ws)) return null;
+    var tMid=fit.tMid, cy=fit.coefY, cx=fit.coefX;
+    function peval(c, tt){ var tc=tt-tMid; return {v:c.c0+c.c1*tc+c.c2*tc*tc, d:c.c1+2*c.c2*tc}; }
+    var yS=peval(cy, ws);
+    var yArr=peval(cy, we).v; // 実測フィット軌道の到達高さ（到達 x = フィット x(we) に対応する時刻 we）
+    var xS, xArr;
+    if(cx){
+      xS=peval(cx, ws);
+      xArr=peval(cx, we).v;
+    }else{
+      // xフィットが得られない場合の線形フォールバック（先頭〜末尾サンプルの平均速度）
+      var x0=Number(samples[0].xPx)/ppm, x1=Number(samples[n-1].xPx)/ppm;
+      var t0=Number(samples[0].t), t1=Number(samples[n-1].t);
+      var vxm=(t1>t0) ? (x1-x0)/(t1-t0) : 0;
+      xS={v:x0+vxm*(ws-t0), d:vxm};
+      xArr=x0+vxm*(we-t0);
+    }
+    if(!(xArr>xS.v)) return null; // 到達点がリリース点より先にないと比較できない
+    // 比較軌道: dvx/dt=-k|v|vx, dvy/dt=-k|v|vy-g（マグヌスなし）を RK4 で積分
+    var k=K_DRAG;
+    function deriv(s){
+      var vx=s[2], vy=s[3], v=Math.sqrt(vx*vx+vy*vy);
+      return [vx, vy, -k*v*vx, -k*v*vy-g];
+    }
+    function rk4(s, h){
+      var k1=deriv(s);
+      var a=[s[0]+k1[0]*h/2, s[1]+k1[1]*h/2, s[2]+k1[2]*h/2, s[3]+k1[3]*h/2];
+      var k2=deriv(a);
+      var b=[s[0]+k2[0]*h/2, s[1]+k2[1]*h/2, s[2]+k2[2]*h/2, s[3]+k2[3]*h/2];
+      var k3=deriv(b);
+      var c=[s[0]+k3[0]*h, s[1]+k3[1]*h, s[2]+k3[2]*h, s[3]+k3[3]*h];
+      var k4=deriv(c);
+      return [0,1,2,3].map(function(i2){ return s[i2]+h/6*(k1[i2]+2*k2[i2]+2*k3[i2]+k4[i2]); });
+    }
+    var s=[xS.v, yS.v, xS.d, yS.d];
+    var h=0.0002, t=ws, yComp=null;
+    var maxT=we+0.5;
+    while(t<maxT){
+      var s2=rk4(s, h);
+      t+=h;
+      if(s[0]<xArr && s2[0]>=xArr){
+        var f=(xArr-s[0])/((s2[0]-s[0])||1e-12); // x が xArr をまたいだ時点を線形補間
+        yComp=s[1]+f*(s2[1]-s[1]);
+        break;
+      }
+      s=s2;
+      if(s[0]>=xArr){ yComp=s[1]; break; }
+    }
+    if(yComp==null) yComp=s[1]; // 到達 x に達しない場合（例: vx<=0）は windowEnd 時点の高さで代用
+    var ivbCm=(yArr-yComp)*100; // 実測フィットが重力・空気抵抗のみの比較軌道よりどれだけ浮くか
+    return {ivbCm:ivbCm, fit:fit};
+  }
+
   return {
     SAMPLE_MS:SAMPLE_MS, TRIG_MIN:TRIG_MIN, TRIG_RATIO:TRIG_RATIO, TRIG_STREAK:TRIG_STREAK,
     QUIET_ABS:QUIET_ABS, QUIET_RATIO:QUIET_RATIO, QUIET_MS:QUIET_MS, MAX_REC_MS:MAX_REC_MS, ARM_MS:ARM_MS,
@@ -1486,7 +1752,9 @@ var KYU=(function(){
     adaptiveThreshold:adaptiveThreshold, mergeCandidates:mergeCandidates, minIntervalFilter:minIntervalFilter,
     detectPeaks:detectPeaks, fpsFromFrameTimes:fpsFromFrameTimes, chunkRanges:chunkRanges, segmentPitches:segmentPitches,
     pxPerMeter:pxPerMeter, releaseAdvanceM:releaseAdvanceM, letterboxRect:letterboxRect,
-    clientToVideoPx:clientToVideoPx, videoPxToPercent:videoPxToPercent, speechTextForKmh:speechTextForKmh
+    clientToVideoPx:clientToVideoPx, videoPxToPercent:videoPxToPercent, speechTextForKmh:speechTextForKmh,
+    fitFlightPath:fitFlightPath, flightQualityGate:flightQualityGate,
+    ivbFromFit:ivbFromFit, plateSpeedFromInitial:plateSpeedFromInitial, K_DRAG:K_DRAG
   };
 })();
 if(typeof module!=='undefined' && module.exports){ module.exports=KYU; }
@@ -1529,7 +1797,7 @@ var els={
   listDate:$('listDate'), stats:$('stats'), recordList:$('recordList'), toast:$('toast')
 };
 
-var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null, voiceOn:true, calib:{active:false, points:[], source:null, advanceM:null} };
+var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null, voiceOn:true, calib:{active:false, points:[], source:null, advanceM:null, pxPerM:null}, lastIvb:null };
 var q={ stream:null, starting:false, monitor:null, prev:null, gate:KYU.newGate(),
       mode:'off', mediaRec:null, chunks:[], mime:'', recStartAt:0, blob:null, recId:null, arrivalSource:'', analyzeUrl:null };
 var objectUrl=null;
@@ -1967,11 +2235,21 @@ function tile(label, val, sub, accent){
     '<div class="t-val'+(accent?' t-acc':'')+'">'+val+'</div>'+
     (sub?'<div class="t-sub">'+sub+'</div>':'')+'</div>';
 }
-// 球速（特大ヒーロー＝推定初速）＋副次指標タイルのグリッドを組み立てる
+// 球速（特大ヒーロー＝推定初速）＋12タイル（3列×4行）のグリッドを組み立てる
 function resultPanelHTML(r, excludeId){
   var heroKmh = r.kmhInit!=null ? r.kmhInit : r.kmh; // ヒーロー表示球速（推定初速優先）
   var st=dayStats(excludeId, heroKmh);
   var ms=Math.round(r.timeSec*1000);
+  // Phase 3-B: 縦変化量タイルは軌道抽出を実行してゲート合格した記録のみ値を出す（それ以外は「—」）
+  var ivb=state.lastIvb;
+  var ivbOk=(ivb && ivb.pass && typeof ivb.ivbCm==='number' && isFinite(ivb.ivbCm));
+  var ivbVal=ivbOk ? '+'+ivb.ivbCm.toFixed(1)+' cm' : '—';
+  var ivbSub=ivbOk ? '軌道抽出 '+ivb.nUsed+'/'+ivb.nTotal+'点・ゲート合格'
+            : (ivb && ivb.reasons && ivb.reasons.length) ? 'ゲート不合格: '+ivb.reasons.join('、')
+            : '軌道抽出未実行（実験）';
+  // 終速（推定）タイルと減衰率タイル（初速×e^(−kD) とその減衰率%）
+  var plateKmh=(typeof r.plateKmh==='number' && isFinite(r.plateKmh)) ? r.plateKmh : null;
+  var decayPct=(typeof r.decayPct==='number' && isFinite(r.decayPct)) ? r.decayPct : null;
   return '<div class="rpanel">'+
     '<div class="hero-tile"><div class="t-label">推定初速</div><div class="hero-val">'+heroKmh.toFixed(1)+'</div><div class="hero-unit">km/h</div></div>'+
     '<div class="tiles">'+
@@ -1984,6 +2262,9 @@ function resultPanelHTML(r, excludeId){
       tile('本日 平均', st.avg==null?'-':st.avg.toFixed(1), 'km/h')+
       tile('球数', String(st.count), '本日')+
       tile('区間平均', r.kmh.toFixed(1), '実測・リリース→ミット')+
+      tile('縦変化量（実験）', ivbVal, ivbSub)+
+      tile('終速（推定）', plateKmh!=null ? plateKmh.toFixed(1) : '—', plateKmh!=null ? 'km/h ・ 初速'+heroKmh.toFixed(1)+'×e^(−kD)' : 'km/h')+
+      tile('減衰率', decayPct!=null ? decayPct.toFixed(1)+' %' : '—', '初速→終速の空気抵抗減衰（k≈0.00727/m）')+
     '</div></div>';
 }
 function renderQuickResult(){
@@ -2039,6 +2320,7 @@ function buildRec(){
     at:new Date().toISOString(),
     name:els.qPlayerName.value.trim()||'選手',
     kmh:r.kmh, kmhInit:r.kmhInit, accPct:r.accPct, accKmh:r.accKmh, eff:r.eff,
+    plateKmh:(typeof r.plateKmh==='number' && isFinite(r.plateKmh)) ? r.plateKmh : undefined,
     dist:selectedDistance(), corr:state.correction, fps:state.fps,
     frames:r.frames, timeSec:r.timeSec,
     releaseFrame:frameNoOf(state.releaseTime),
@@ -2689,8 +2971,15 @@ els.markArrival.addEventListener('click', function(){
   updateMarks(); updateResult();
 });
 function updateMarks(){
+  state.lastIvb=null; // リリース/到達マークが変わったら前回の軌道抽出結果は無効化
   els.releaseInfo.textContent=markText(state.releaseTime);
   els.arrivalInfo.textContent=markText(state.arrivalTime);
+}
+// タップ校正で得た縮尺(px/m)。未校正なら null（Phase 3-B: この場合は縦変化量を出さない）
+function currentPxPerMeter(){
+  var c=state.calib;
+  if(c && typeof c.pxPerM==='number' && isFinite(c.pxPerM) && c.pxPerM>0) return c.pxPerM;
+  return null;
 }
 
 /* ---- 球速計算 ---- */
@@ -2716,9 +3005,13 @@ function computeResultAt(releaseTime, arrivalTime){
   var kmh=KYU.speedKmhByTime(eff, timeSec);
   var fd=KYU.medianFrameDur(state.frameTimes) || frameDur();
   var accPct=(fd/timeSec)*100;
+  var kmhInit=KYU.initialSpeedFromAvg(kmh, eff);
+  // Phase 3-B: 終速（初速×e^(−kD)）と減衰率%も結果に含める
+  var plate=KYU.plateSpeedFromInitial(kmhInit!=null ? kmhInit : kmh, eff);
   return {status:'ok', frames:frames, timeSec:timeSec, eff:eff, kmh:kmh,
           accPct:accPct, accKmh:kmh*accPct/100, releaseFrame:rf, arrivalFrame:af,
-          kmhInit:KYU.initialSpeedFromAvg(kmh, eff)};
+          kmhInit:kmhInit,
+          plateKmh:plate?plate.plateKmh:null, decayPct:plate?plate.decayPct:null};
 }
 function computeResult(){
   if(state.releaseTime==null || state.arrivalTime==null) return {status:'incomplete'};
@@ -2737,6 +3030,7 @@ function updateResult(){
   lastResultStatus=r.status;
   els.saveBtn.disabled = r.status!=='ok';
   els.shareCurrentBtn.disabled = r.status!=='ok';
+  updateTrajUI(); // 軌道抽出ボタンの有効/無効（リリース点・到達点の設定状態に追従）
   renderQuickResult();
 }
 
@@ -2756,6 +3050,16 @@ function makeRecord(r, o){
     source:o.source||'detail'
   };
   if(o.videoTime!=null) rec.videoTime=o.videoTime; // 一括解析: 動画内時刻(秒)
+  // Phase 3-B: 終速 plateKmh を保存。ivbCm は軌道抽出がゲート合格した記録のみ保存する
+  if(typeof r.plateKmh==='number' && isFinite(r.plateKmh)) rec.plateKmh=r.plateKmh;
+  if(typeof o.ivbCm==='number' && isFinite(o.ivbCm)){
+    rec.ivbCm=o.ivbCm;
+  }else if(state.lastIvb && state.lastIvb.pass && typeof state.lastIvb.ivbCm==='number' &&
+           state.lastIvb.window && state.releaseTime!=null && state.arrivalTime!=null &&
+           Math.abs(state.lastIvb.window.start-state.releaseTime)<1e-9 &&
+           Math.abs(state.lastIvb.window.end-state.arrivalTime)<1e-9){
+    rec.ivbCm=state.lastIvb.ivbCm; // 現マークに対応する合格済み抽出結果があれば記録へ
+  }
   return rec;
 }
 els.saveBtn.addEventListener('click', function(){
@@ -2800,7 +3104,9 @@ function renderRecords(){
     var sub=document.createElement('div'); sub.className='rec-sub';
     sub.textContent=pad(d.getHours(),2)+':'+pad(d.getMinutes(),2)+':'+pad(d.getSeconds(),2)+
       ' ・ '+r.fps+'fps ・ '+r.frames+'F ・ 実効'+r.eff.toFixed(2)+'m ・ ±'+r.accKmh.toFixed(1)+'km/h'+
-      (r.source?' ・ '+(r.source.indexOf('quick')===0?'クイック自動推定':'手動計測'):'');
+      (r.source?' ・ '+(r.source.indexOf('quick')===0?'クイック自動推定':'手動計測'):'')+
+      (typeof r.plateKmh==='number' && isFinite(r.plateKmh)?' ・ 終速'+r.plateKmh.toFixed(1)+'km/h':'')+
+      (typeof r.ivbCm==='number' && isFinite(r.ivbCm)?' ・ IVB +'+r.ivbCm.toFixed(1)+'cm':'')
     info.appendChild(top); info.appendChild(sub);
     var btns=document.createElement('div'); btns.className='rec-btns';
     var share=document.createElement('button'); share.className='btn btn-small'; share.textContent='共有画像';
@@ -3013,7 +3319,7 @@ function startCalibration(){
   renderCalibMarkers(); updateCalibUI();
 }
 function redoCalibration(){
-  state.calib.active=true; state.calib.points=[]; state.calib.source=null; state.calib.advanceM=null;
+  state.calib.active=true; state.calib.points=[]; state.calib.source=null; state.calib.advanceM=null; state.calib.pxPerM=null;
   calibEls.start.hidden=true; calibEls.redo.hidden=false; calibEls.cancel.hidden=false;
   renderCalibMarkers(); updateCalibUI();
 }
@@ -3023,7 +3329,7 @@ function cancelCalibration(){
   renderCalibMarkers(); updateCalibUI();
 }
 function resetCalibration(){ // 動画を読み替えたら校正をリセット
-  state.calib={active:false, points:[], source:null, advanceM:null};
+  state.calib={active:false, points:[], source:null, advanceM:null, pxPerM:null};
   if(calibEls){ calibEls.start.hidden=false; calibEls.redo.hidden=true; calibEls.cancel.hidden=true; }
   renderCalibMarkers(); updateCalibUI();
 }
@@ -3047,7 +3353,7 @@ function finishCalibration(){
     toast('2点がほぼ同じ位置のため校正できませんでした。やり直してください');
     return;
   }
-  c.source='tap'; c.advanceM=adv;
+  c.source='tap'; c.advanceM=adv; c.pxPerM=ppm; // Phase 3-B: 軌道抽出の縮尺(px/m)として保持
   state.correction=clampCorrection(adv); // 既存の clamp（0〜3m・step 0.1）を適用して反映
   c.active=false;
   calibEls.start.hidden=false; calibEls.redo.hidden=true; calibEls.cancel.hidden=true;
@@ -3101,6 +3407,186 @@ function renderCalibMarkers(){
   });
 }
 
+/* ---- Phase 3-B: ボール軌道抽出と縦変化量の実験表示（詳細モード・JS生成UI。HTMLは無変更） ----
+   「軌道抽出」ボタンはリリース点と到達点が設定されたときだけ有効。
+   処理: リリース〜到達のフレーム区間を既存スキャン用キャンバス(SCAN_W×SCAN_H)で走査し、
+   前フレームとの差分（pixelmatch/motionMetric と同じ仕組み）から動きブロブの重心を候補点とする。
+   探索窓は前候補位置からの等速外挿で絞り、x方向に単調に進む候補だけを繋ぎ、
+   最後にリリース位置〜到達位置を結ぶ帯状ROIで絞り込む。
+   フレーム時刻は state.frameTimes（MP4サンプルテーブル）を優先。
+   pxPerMeter はタップ校正の値があればそれを使い、無ければ「未校正」と明示して変化量は出さない。
+   抽出できたら ivbFromFit + flightQualityGate を実行し、合格時のみ結果パネルに縦変化量を表示する。 */
+var TRAJ_DIFF_THR=18;   // グレースケール差分のしきい値
+var TRAJ_MIN_PX=3;       // 候補とみなす最小変化ピクセル数
+var TRAJ_SEARCH_R=9;     // 探索窓の半径（スキャン座標px。初回は全画面）
+var TRAJ_BAND_HALF=10;   // 帯状ROIの半幅（スキャン座標px）
+var TRAJ_MOTION_MIN=0.3; // フレーム間動き量の下限（motionMetric の 0-255 スケール換算）
+var trajEls=null;
+// 探索窓内で |grayB-grayA|>thr のピクセルの重心（差分量で重み付け）を返す。無ければ null
+function blobCentroid(grayA, grayB, cx, cy, r, w, h, thr){
+  var x0=Math.max(0, Math.floor(cx-r)), x1=Math.min(w-1, Math.ceil(cx+r));
+  var y0=Math.max(0, Math.floor(cy-r)), y1=Math.min(h-1, Math.ceil(cy+r));
+  var sw=0, sx=0, sy=0, n=0, x, y, d;
+  for(y=y0;y<=y1;y++){
+    for(x=x0;x<=x1;x++){
+      d=grayB[y*w+x]-grayA[y*w+x];
+      if(d<0) d=-d;
+      if(d>thr){ sw+=d; sx+=d*x; sy+=d*y; n++; }
+    }
+  }
+  if(!n || !sw) return null;
+  return {x:sx/sw, y:sy/sw, n:n};
+}
+// 候補列を帯状ROI（先頭候補=リリース位置〜末尾候補=到達位置を結ぶ線分からの垂直距離）と
+// x単調性で絞り込み、スキャン座標→実映像pxに変換して {t,xPx,yPx} 列を返す
+function buildTrajSamples(cands, tOf, scaleX, scaleY){
+  var mapOne=function(c){ return {t:tOf(c.i), xPx:c.x*scaleX, yPx:c.y*scaleY}; };
+  if(!cands || !cands.length) return [];
+  if(cands.length<2) return [mapOne(cands[0])];
+  var p0=cands[0], p1=cands[cands.length-1];
+  var dx=p1.x-p0.x, dy=p1.y-p0.y, len2=dx*dx+dy*dy;
+  var kept=cands;
+  if(len2>1e-9){
+    var len=Math.sqrt(len2);
+    kept=cands.filter(function(c){
+      var d=Math.abs(dy*(c.x-p0.x)-dx*(c.y-p0.y))/len; // 点と線分の垂直距離
+      return d<=TRAJ_BAND_HALF;
+    });
+    if(kept.length<2) kept=cands;
+  }
+  var out=[], lastX=-1e12;
+  kept.forEach(function(c){
+    if(c.x>=lastX-1e-9){ out.push(mapOne(c)); lastX=c.x; } // x方向に単調に進む候補だけ繋ぐ
+  });
+  return out;
+}
+// リリース〜到達フレーム区間を走査してボール候補列 {t,xPx,yPx} を返す（Promise）。失敗時 reject
+function extractBallPath(v, o){
+  return new Promise(function(res, rej){
+    try{
+      var fps=o.fps||state.fps;
+      var ft=(o.frameTimes && o.frameTimes.length) ? o.frameTimes : null; // フレーム時刻はMP4サンプルテーブル優先
+      var tOf=function(i){ return ft ? ft[Math.max(0, Math.min(ft.length-1, i))] : i/fps; };
+      var total=(ft && ft.length) ? ft.length : totalFrames();
+      var fi0=Math.max(0, Math.round(o.releaseIdx));
+      var fi1=Math.min(Math.round(o.arrivalIdx), Math.max(fi0+1, total-1));
+      if(!(fi1>fi0)){ res([]); return; }
+      var x=getScanCtx(); // 既存の走査用キャンバスを流用
+      var scaleX=((v.videoWidth||0)>0 ? v.videoWidth : SCAN_W)/SCAN_W;
+      var scaleY=((v.videoHeight||0)>0 ? v.videoHeight : SCAN_H)/SCAN_H;
+      var i=Math.max(0, fi0-1); // リリース1つ前をベースフレームにして、リリースフレームの動きを拾う
+      var prevD=null, prevGray=null;
+      var cands=[], last=null, vel={x:0, y:0};
+      function stepOne(){
+        if(i>fi1){ res(buildTrajSamples(cands, tOf, scaleX, scaleY)); return; }
+        seekVideo(v, tOf(i)).then(function(){
+          var drew=true;
+          try{ x.drawImage(v,0,0,SCAN_W,SCAN_H); }catch(e){ drew=false; }
+          if(!drew){ i++; stepOne(); return; }
+          var d=x.getImageData(0,0,SCAN_W,SCAN_H).data;
+          var gray=KYU.toGray(d);
+          if(prevD && i>=fi0){
+            var m=KYU.motionMetric(prevD, d, SCAN_W, SCAN_H); // 既存の差分検出（pixelmatch優先）を流用
+            if(m>=TRAJ_MOTION_MIN){
+              // 探索窓は前候補位置＋等速外挿で絞る（初回は全画面）
+              var ctr=last ? {x:last.x+vel.x, y:last.y+vel.y} : {x:SCAN_W/2, y:SCAN_H/2};
+              var r=last ? TRAJ_SEARCH_R : Math.max(SCAN_W, SCAN_H)/2;
+              var blob=blobCentroid(prevGray, gray, ctr.x, ctr.y, r, SCAN_W, SCAN_H, TRAJ_DIFF_THR);
+              if(blob && blob.n>=TRAJ_MIN_PX && (!last || blob.x>=last.x-0.5)){ // x方向に単調に進む候補のみ採用
+                if(last) vel={x:blob.x-last.x, y:blob.y-last.y}; // 等速外挿の速度を更新
+                last=blob;
+                cands.push({i:i, x:blob.x, y:blob.y});
+              }
+            }
+          }
+          prevD=d; prevGray=gray;
+          i++; stepOne();
+        }).catch(function(){ i++; stepOne(); });
+      }
+      stepOne();
+    }catch(e){ rej(e); }
+  });
+}
+function buildTrajUI(){
+  if(trajEls) return;
+  var card=document.createElement('div');
+  card.className='card'; card.id='trajCard';
+  card.innerHTML=
+    '<h2>ボール軌道抽出（実験）</h2>'+
+    '<p class="muted small">リリース点〜到達点のフレーム区間を走査し、リリース位置と到達位置を結ぶ帯状ROIの中で動いているブロブの重心をボール候補として抽出します。タップ校正の pxPerMeter がある場合のみ、抽出した軌道をフィットして縦変化量（IVB・実験表示）を結果パネルに出します。未校正の場合は「未校正」と表示し、球速のみの従来動作になります。</p>'+
+    '<div class="mark-row" style="margin-top:8px">'+
+      '<button class="btn btn-primary" id="trajStartBtn" disabled>軌道抽出を実行</button>'+
+    '</div>'+
+    '<p id="trajStatus" class="muted small" style="margin-top:6px"></p>';
+  var anchor=(calibEls && calibEls.card) || els.video.closest('.card'); // タップ校正カードの直後に挿入
+  (anchor && anchor.parentNode ? anchor.parentNode : els.detailView).insertBefore(card, anchor ? anchor.nextSibling : null);
+  trajEls={card:card, start:$('trajStartBtn'), status:$('trajStatus')};
+  trajEls.start.addEventListener('click', function(){ runTrajectoryExtraction(); });
+  updateTrajUI();
+}
+function updateTrajUI(){
+  if(!trajEls) return;
+  trajEls.start.disabled = !(state.loaded && state.releaseTime!=null && state.arrivalTime!=null);
+}
+function trajStatus(msg){ if(trajEls) trajEls.status.textContent=msg; }
+// 軌道抽出の実行: 抽出 → ivbFromFit → flightQualityGate → 合格時のみ state.lastIvb に結果を保持して結果パネルへ
+function runTrajectoryExtraction(){
+  if(!state.loaded){ toast('先に動画を読み込んでください'); return Promise.resolve(null); }
+  if(state.releaseTime==null || state.arrivalTime==null){ toast('先にリリース点と到達点を設定してください'); return Promise.resolve(null); }
+  var v=els.video;
+  var ws=state.releaseTime, we=state.arrivalTime;
+  if(!(we>ws)){ toast('到達点はリリース点より後に設定してください'); return Promise.resolve(null); }
+  var ppm=currentPxPerMeter();
+  if(!(ppm>0)){
+    // 未校正: 縦変化量は出さない（球速のみの従来動作）
+    state.lastIvb=null;
+    trajStatus('未校正（タップ校正が未実施のため pxPerMeter がありません）。縦変化量は表示しません。球速のみの従来動作です。「タップ校正」で2点を打てば軌道抽出できます。');
+    updateResult();
+    return Promise.resolve(null);
+  }
+  var hasFT=!!(state.frameTimes && state.frameTimes.length);
+  var fi0=hasFT ? KYU.frameIndexAt(state.frameTimes, ws) : Math.round(ws*state.fps);
+  var fi1=hasFT ? KYU.frameIndexAt(state.frameTimes, we) : Math.round(we*state.fps);
+  var fpsEff=KYU.fpsFromFrameTimes(state.frameTimes)||state.fps;
+  trajStatus('軌道抽出中…（F'+pad(fi0,4)+'〜F'+pad(fi1,4)+' を走査）');
+  trajEls.start.disabled=true;
+  return extractBallPath(v, {releaseIdx:fi0, arrivalIdx:fi1, frameTimes:state.frameTimes, fps:fpsEff}).then(function(samples){
+    trajEls.start.disabled=false;
+    if(!samples || samples.length<5){
+      state.lastIvb=null;
+      trajStatus('ボール候補を抽出できませんでした（検出 '+((samples&&samples.length)||0)+' 点）。マーク位置をコマ送りで調整して再実行してください。');
+      updateResult();
+      return null;
+    }
+    var res=KYU.ivbFromFit(samples, {pxPerMeter:ppm, fps:fpsEff, windowStart:ws, windowEnd:we});
+    if(!res || !res.fit){
+      state.lastIvb=null;
+      trajStatus('軌道フィットに失敗しました（検出 '+samples.length+' 点）');
+      updateResult();
+      return null;
+    }
+    var gate=KYU.flightQualityGate(res.fit);
+    if(gate.pass){
+      state.lastIvb={pass:true, ivbCm:res.ivbCm, nUsed:res.fit.nUsed, nTotal:res.fit.nTotal,
+                     rmsePx:res.fit.rmsePx, coverage:res.fit.coverage, window:{start:ws, end:we}};
+      trajStatus('抽出 '+res.fit.nUsed+'/'+res.fit.nTotal+' 点（カバー率 front/mid/back '+
+        res.fit.coverage.front.toFixed(2)+'/'+res.fit.coverage.mid.toFixed(2)+'/'+res.fit.coverage.back.toFixed(2)+
+        ' ・ RMSE '+res.fit.rmsePx.toFixed(2)+'px）→ ゲート合格。縦変化量 +'+res.ivbCm.toFixed(1)+' cm（実験表示）');
+    }else{
+      state.lastIvb={pass:false, ivbCm:null, reasons:gate.reasons, window:{start:ws, end:we}};
+      trajStatus('ゲート不合格のため縦変化量は表示しません: '+gate.reasons.join('、')+'（抽出 '+res.fit.nUsed+'/'+res.fit.nTotal+' 点）');
+    }
+    updateResult();
+    return state.lastIvb;
+  }).catch(function(e){
+    trajEls.start.disabled=false;
+    state.lastIvb=null;
+    trajStatus('軌道抽出に失敗しました: '+(e && e.message || e));
+    updateResult();
+    return null;
+  });
+}
+
 /* ---- 初期化 ---- */
 (function init(){
   var qs=loadQuickSettings();
@@ -3119,6 +3605,7 @@ function renderCalibMarkers(){
   renderRecords();
   buildBatchUI(); // 一括解析カードを「1. 動画を読み込む」の直後へJSで挿入
   buildCalibUI(); // タップ校正カードを「2. コマ送り」カードの直後へJSで挿入
+  buildTrajUI();  // 軌道抽出カードをタップ校正カードの直後へJSで挿入（Phase 3-B）
   buildVoiceToggles(); // 音声読み上げトグルをクイック/詳細の設定へJSで挿入
   setView('quick'); // 初期画面はクイック計測。カメラを自動起動
 })();
@@ -3143,7 +3630,12 @@ if(typeof module!=='undefined' && module.exports){
     corrLabel:corrLabel, clampCorrection:clampCorrection, clearCalibSource:clearCalibSource,
     syncDistUI:syncDistUI, loadDetailVideo:loadDetailVideo, selectedDistance:selectedDistance, effectiveDistance:effectiveDistance,
     saveQuickSettings:saveQuickSettings, loadQuickSettings:loadQuickSettings,
-    onHeightInput:onHeightInput, setView:setView, updateResult:updateResult
+    onHeightInput:onHeightInput, setView:setView, updateResult:updateResult,
+    resultPanelHTML:resultPanelHTML, tile:tile, dayStats:dayStats, dispKmh:dispKmh, markText:markText,
+    currentPxPerMeter:currentPxPerMeter, updateMarks:updateMarks,
+    blobCentroid:blobCentroid, buildTrajSamples:buildTrajSamples, extractBallPath:extractBallPath,
+    buildTrajUI:buildTrajUI, updateTrajUI:updateTrajUI, runTrajectoryExtraction:runTrajectoryExtraction,
+    trajEls:function(){ return trajEls; }
   };
 }
 })();
