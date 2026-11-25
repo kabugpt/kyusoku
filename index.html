@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.9 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.10 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -1498,6 +1498,29 @@ var KYU=(function(){
     return x;
   }
 
+  // n×n連立方程式を部分ピボット付きガウス消去で解く（シューティングフィットの正規方程式用）。特異なら null
+  function solveN(A,b){
+    var n=A.length, m=[], i, j, k;
+    for(i=0;i<n;i++){ m.push(A[i].slice()); m[i].push(b[i]); }
+    for(k=0;k<n;k++){
+      var p=k;
+      for(i=k+1;i<n;i++){ if(Math.abs(m[i][k])>Math.abs(m[p][k])) p=i; }
+      if(!(Math.abs(m[p][k])>1e-14)) return null;
+      if(p!==k){ var tmp=m[p]; m[p]=m[k]; m[k]=tmp; }
+      for(i=k+1;i<n;i++){
+        var f=m[i][k]/m[k][k];
+        for(j=k;j<=n;j++){ m[i][j]-=f*m[k][j]; }
+      }
+    }
+    var x=new Array(n).fill(0);
+    for(i=n-1;i>=0;i--){
+      var s=m[i][n];
+      for(j=i+1;j<n;j++){ s-=m[i][j]*x[j]; }
+      x[i]=s/m[i][i];
+    }
+    return x;
+  }
+
   // y = c0 + c1*tc + c2*tc^2 の最小二乗フィット。points=[{tc,y}]（tcは時刻オフセット済み）。
   // 時刻シフトは {1,t,t^2} の張る空間を変えないので c2 はシフト不変。3点未満・特異なら null
   function fitParabola(points){
@@ -1619,6 +1642,17 @@ var KYU=(function(){
       if(k<0) k=0; if(k>2) k=2;
       cov[k]++; inWin++;
     }
+    // 最大連続欠落フレーム数（カバー率窓内。窓端〜最初/最後のサンプル間の欠落も数える）
+    var maxRun=0, prevT=covStart, seen=0;
+    for(i=0;i<n;i++){
+      if(hasWin && (t[i]<ws || t[i]>we)) continue;
+      var gap=Math.round((t[i]-prevT)*fps) - (seen>0 ? 1 : 0); // 内部ギャップ: 間隔がkフレーム分なら欠落は k-1
+      if(gap>maxRun) maxRun=gap;
+      prevT=t[i]; seen++;
+    }
+    var tailGap=Math.round((covStart+covDur-prevT)*fps);
+    if(tailGap>maxRun) maxRun=tailGap;
+    if(!(maxRun>0)) maxRun=0;
     return {
       aMagnus:aMagnus,
       hopCm:hopM*100,
@@ -1629,17 +1663,23 @@ var KYU=(function(){
       coefY:{c0:fit.c0, c1:fit.c1, c2:fit.c2}, // y(t)=c0+c1*(t-tMid)+c2*(t-tMid)^2 [m, 上向き正]
       coefX:xCoef,                            // x(t) の2次フィット（失敗時 null）
       window:hasWin ? {start:ws, end:we} : null,
-      coverage:{front:cov[0]/expSeg, mid:cov[1]/expSeg, back:cov[2]/expSeg, overall:inWin/expAll}
+      coverage:{front:cov[0]/expSeg, mid:cov[1]/expSeg, back:cov[2]/expSeg, overall:inWin/expAll},
+      mask:mask,                              // 外れ値除去後の使用マスク（ivbFromFit のシューティングフィット用）
+      maxMissingRun:maxRun,                   // カバー率窓内の最大連続欠落フレーム数
+      expFrames:expAll                        // カバー率窓の期待フレーム数（= covDur*fps）
     };
   }
 
-  // 飛行品質ゲート: 区間別カバー率とフィット残差で軌道推定の信頼性を判定する純粋関数
-  // 既定基準: front/mid/back 各0.30以上、overall 0.60以上、rmsePx 2.0以下（thresholdsで上書き可）
+  // 飛行品質ゲート: 区間別カバー率・フィット残差・最大連続欠落で軌道推定の信頼性を判定する純粋関数
+  // 既定基準(G2+): front/back 各0.40以上、mid 0.30以上、overall 0.60以上、rmsePx 2.0以下、
+  //   かつ最大連続欠落フレーム数が期待フレーム数の15%以下（thresholdsで上書き可）
+  //   （先頭/末尾集中・ブロック欠落で誤差の大きいケースを通しにくくするため front/back を 0.30→0.40 に引き上げ、
+  //     最大連続欠落の上限を追加した）
   // 戻り値 {pass:boolean, reasons:[不足項目の文字列]}
   function flightQualityGate(metrics, thresholds){
-    var th={front:0.30, mid:0.30, back:0.30, overall:0.60, rmsePx:2.0};
+    var th={front:0.40, mid:0.30, back:0.40, overall:0.60, rmsePx:2.0, maxRun:0.15};
     if(thresholds && typeof thresholds==='object'){
-      var keys=['front','mid','back','overall','rmsePx'], ki;
+      var keys=['front','mid','back','overall','rmsePx','maxRun'], ki;
       for(ki=0;ki<keys.length;ki++){
         var k=keys[ki], v=thresholds[k];
         if(typeof v==='number' && isFinite(v)) th[k]=v;
@@ -1655,6 +1695,11 @@ var KYU=(function(){
     if(!(typeof c.overall==='number' && isFinite(c.overall) && c.overall>=th.overall)) reasons.push('全体カバー率不足');
     var rmse=Number(metrics.rmsePx);
     if(!(isFinite(rmse) && rmse<=th.rmsePx)) reasons.push('フィット残差超過');
+    // 最大連続欠落: metrics が maxMissingRun/expFrames を持つ場合のみ評価（旧形式の metrics では評価しない）
+    var mr=Number(metrics.maxMissingRun), ef=Number(metrics.expFrames);
+    if(isFinite(mr) && isFinite(ef) && ef>0){
+      if(!(mr/ef<=th.maxRun)) reasons.push('最大連続欠落超過');
+    }
     return {pass:reasons.length===0, reasons:reasons};
   }
 
@@ -1668,11 +1713,96 @@ var KYU=(function(){
     return {plateKmh:v*r, decayPct:(1-r)*100, kD:kD};
   }
 
-  // IVB（縦変化量）の比較軌道方式推定（Phase 3-B）:
-  // fitFlightPath のフィットから windowStart 時点の初期状態 (x,y,vx,vy) を推定し、
-  // (i) 実測フィット軌道と (ii) 同じ初期状態から「重力＋2次空気抵抗のみ（マグヌスなし）」で
-  // RK4積分した比較軌道を、到達 x（x方向の到達点 = windowEnd 時点のフィット x）まで進め、
-  // 到達高さの差を cm で返す。戻り値 {ivbCm, fit}（fit は fitFlightPath の結果）。失敗時 null。
+  // 抗力+マグヌス揚力モデルのシューティングフィット（ivbFromFit 用）:
+  // モデル dvx/dt=-k|v|vx - L|v|vy, dvy/dt=-k|v|vy - g + L|v|vx（L: 揚力係数 [1/m]、揚力は速度に垂直上向き）
+  // を窓内サンプル (times, xs, ys) に直接フィットする。パラメータは windowStart における初期状態
+  // (x0,y0,vx0,vy0) と L の5個で、ガウス・ニュートン法（数値ヤコビアン + solveN、最大4反復、
+  // 残差が改善しなくなったら打ち切り）で推定する。初期値は放物線フィットの windowStart 評価値と
+  // c2 からの揚力初期値 L0=(2*c2+g)/v0^2。
+  // 戻り値 {ivbCm, liftCoef, rss}。ivbCm はフィットした初期状態から「揚力あり(L)」「揚力なし(0)」の
+  // 2本のモデル軌道を windowEnd まで RK4積分したときの到達高さの差 [cm]。
+  function shootIvbFit(times, xs, ys, ws, we, tMid, cy, cx, g){
+    var k=K_DRAG, m=times.length, i;
+    function peval(c, tt){ var tc=tt-tMid; return {v:c.c0+c.c1*tc+c.c2*tc*tc, d:c.c1+2*c.c2*tc}; }
+    var xS=peval(cx, ws), yS=peval(cy, ws);
+    var v0=Math.sqrt(xS.d*xS.d + yS.d*yS.d); if(!(v0>0)) v0=1;
+    var th=[xS.v, yS.v, xS.d, yS.d, (2*cy.c2+g)/(v0*v0)];
+    var deltas=[1e-4, 1e-4, 1e-3, 1e-3, 1e-6];
+    function deriv(s, L){
+      var vx=s[2], vy=s[3], v=Math.sqrt(vx*vx+vy*vy);
+      return [vx, vy, -k*v*vx - L*v*vy, -k*v*vy - g + L*v*vx];
+    }
+    function rk4(s, h, L){
+      var k1=deriv(s, L);
+      var a=[s[0]+k1[0]*h/2, s[1]+k1[1]*h/2, s[2]+k1[2]*h/2, s[3]+k1[3]*h/2];
+      var k2=deriv(a, L);
+      var b=[s[0]+k2[0]*h/2, s[1]+k2[1]*h/2, s[2]+k2[2]*h/2, s[3]+k2[3]*h/2];
+      var k3=deriv(b, L);
+      var c=[s[0]+k3[0]*h, s[1]+k3[1]*h, s[2]+k3[2]*h, s[3]+k3[3]*h];
+      var k4=deriv(c, L);
+      return [0,1,2,3].map(function(i2){ return s[i2]+h/6*(k1[i2]+2*k2[i2]+2*k3[i2]+k4[i2]); });
+    }
+    var H=0.0008; // モデル軌道の RK4 刻み
+    // s0 から各サンプル時刻を踏んで積分し (x,y) を記録する。toEnd=true ならさらに we まで進めて end を返す
+    function traj(s0, L, toEnd){
+      var out=new Array(m), s=s0.slice(), t=ws;
+      for(var kk=0;kk<m;kk++){
+        while(t<times[kk]-1e-12){ var hh=Math.min(H, times[kk]-t); s=rk4(s, hh, L); t+=hh; }
+        out[kk]=[s[0], s[1]];
+      }
+      if(toEnd){ while(t<we-1e-12){ var hh2=Math.min(H, we-t); s=rk4(s, hh2, L); t+=hh2; } }
+      return {at:out, end:s};
+    }
+    function rssOf(tr){
+      var r=0;
+      for(var kk=0;kk<m;kk++){ var rx=tr.at[kk][0]-xs[kk], ry=tr.at[kk][1]-ys[kk]; r+=rx*rx+ry*ry; }
+      return r;
+    }
+    var cur=traj([th[0],th[1],th[2],th[3]], th[4], false), rss=rssOf(cur), iter, p, q, ii;
+    for(iter=0; iter<4; iter++){
+      var J=[];
+      for(p=0;p<5;p++){
+        var th2=th.slice(); th2[p]+=deltas[p];
+        var tr2=traj([th2[0],th2[1],th2[2],th2[3]], th2[4], false);
+        var col=new Array(2*m);
+        for(var kk=0;kk<m;kk++){
+          col[2*kk]=(tr2.at[kk][0]-cur.at[kk][0])/deltas[p];
+          col[2*kk+1]=(tr2.at[kk][1]-cur.at[kk][1])/deltas[p];
+        }
+        J.push(col);
+      }
+      var r=new Array(2*m);
+      for(var kk2=0;kk2<m;kk2++){ r[2*kk2]=cur.at[kk2][0]-xs[kk2]; r[2*kk2+1]=cur.at[kk2][1]-ys[kk2]; }
+      var A=[[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0]], b=[0,0,0,0,0];
+      for(ii=0;ii<r.length;ii++){
+        for(p=0;p<5;p++){
+          b[p]-=J[p][ii]*r[ii];
+          for(q=0;q<5;q++){ A[p][q]+=J[p][ii]*J[q][ii]; }
+        }
+      }
+      for(p=0;p<5;p++){ A[p][p]*=1.0001; } // わずかな LM ダンピング
+      var d=solveN(A, b);
+      if(!d) break;
+      var th3=th.map(function(v, idx){ return v+d[idx]; });
+      var tr3=traj([th3[0],th3[1],th3[2],th3[3]], th3[4], false);
+      var rss3=rssOf(tr3);
+      if(!(rss3<rss)) break; // 改善しなければ現状の推定を維持
+      th=th3; cur=tr3; rss=rss3;
+    }
+    var sEnd=[th[0], th[1], th[2], th[3]];
+    var withL=traj(sEnd, th[4], true).end[1];
+    var noL=traj(sEnd, 0, true).end[1];
+    return {ivbCm:(withL-noL)*100, liftCoef:th[4], rss:rss};
+  }
+
+  // IVB（縦変化量）の推定（シューティングフィット方式）:
+  // 抗力+マグヌス揚力モデルを窓内サンプルに直接フィットし（shootIvbFit）、フィットした初期状態から
+  // 「揚力あり/なし」の2軌道の到達時刻 windowEnd における高さ差を IVB とする。
+  // （従来は放物線フィットの初期状態から比較軌道を到達 x まで進めていたが、抗力ありの実軌道は放物線
+  //   でないため初期状態推定に系統誤差が乗り、ノイズなしでも +2cm 程度の正バイアスが生じていた。
+  //   物理モデルを直接フィットすることでこのモデル不一致を除去する）
+  // シューティングフィットが使えない場合は従来の比較軌道方式にフォールバックする。
+  // 戻り値 {ivbCm, fit, liftCoef, fitRss}（fit は fitFlightPath の結果）。失敗時 null。
   function ivbFromFit(samples, opts){
     opts=opts||{};
     var fit=fitFlightPath(samples, opts);
@@ -1687,6 +1817,21 @@ var KYU=(function(){
     if(!(we>ws)) return null;
     var tMid=fit.tMid, cy=fit.coefY, cx=fit.coefX;
     function peval(c, tt){ var tc=tt-tMid; return {v:c.c0+c.c1*tc+c.c2*tc*tc, d:c.c1+2*c.c2*tc}; }
+    // シューティングフィットの対象点: 窓 [ws,we] 内の外れ値除去済みサンプル
+    var times=[], xs=[], ys=[], i2;
+    for(i2=0;i2<n;i2++){
+      var tt2=Number(samples[i2].t);
+      if(!(tt2>=ws && tt2<=we)) continue;
+      if(fit.mask && !fit.mask[i2]) continue;
+      times.push(tt2);
+      xs.push(Number(samples[i2].xPx)/ppm);
+      ys.push(-Number(samples[i2].yPx)/ppm);
+    }
+    if(cx && times.length>=6){
+      var shot=shootIvbFit(times, xs, ys, ws, we, tMid, cy, cx, g);
+      if(shot) return {ivbCm:shot.ivbCm, fit:fit, liftCoef:shot.liftCoef, fitRss:shot.rss};
+    }
+    // ---- フォールバック: 従来の比較軌道方式（放物線ICからの比較軌道を到達 x まで進める） ----
     var yS=peval(cy, ws);
     var yArr=peval(cy, we).v; // 実測フィット軌道の到達高さ（到達 x = フィット x(we) に対応する時刻 we）
     var xS, xArr;
