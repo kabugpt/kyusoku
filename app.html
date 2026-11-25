@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.11 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.12 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -2215,6 +2215,489 @@ var KYU=(function(){
     });
   }
 
+  /* ---- Phase 2: 姿勢推定イベント検出（work/pose-events.js の PoC ロジックを移植。検証済みアルゴリズムは不変） ----
+     姿勢推定ランドマーク列から投球イベント（軸足接地・リリース候補）を検出する純粋ロジック。DOM非依存で単体テスト可能。
+     frames: [{t(秒), landmarks:{leftAnkle:{x,y}, ..., 任意で leftHeel/leftFootIndex 等}}]（x,y は画像正規化座標・y下向き正）
+     opts: {hand:'right'|'left', direction:+1|-1}（direction は投球方向の x 符号。+1 = 画像右向きに投げる）
+     PoCからの唯一の改良点: 接地判定の足 y は足首(Ankle)だけでなく、ランドマークに heel（踵）と foot_index（つま先）が
+     あればそちらを優先して使う（MediaPipe Pose の33点には含まれる。y下向き正なので床に近い方 = 大きい方を採用）。
+     無いフレームでは足首にフォールバックする。検出アルゴリズム自体（速度遷移・dwell・ヒンジフィット等）は変更しない。 */
+
+  function poseIsFiniteNum(v){ return typeof v==='number' && isFinite(v); }
+  function poseClamp(v,a,b){ return v<a?a:(v>b?b:v); }
+
+  // 中心移動平均（端は縮小ウィンドウ）
+  function poseMovingAverage(ys, half){
+    var n=ys.length, out=new Array(n), i, j, s, c;
+    for(i=0;i<n;i++){
+      s=0; c=0;
+      for(j=Math.max(0,i-half); j<=Math.min(n-1,i+half); j++){ s+=ys[j]; c++; }
+      out[i]=s/c;
+    }
+    return out;
+  }
+
+  // i 中心の線形回帰スロープ（half=2なら窓5）を dt で割って速度にする
+  function poseSlopeAt(ys, i, half, dt){
+    var n=ys.length;
+    var a=Math.max(0,i-half), b=Math.min(n-1,i+half);
+    if(b-a<1 || dt<=0) return 0;
+    var sx=0, sy=0, sxx=0, sxy=0, c=b-a+1, j, x;
+    for(j=a;j<=b;j++){ x=j; sx+=x; sy+=ys[j]; sxx+=x*x; sxy+=x*ys[j]; }
+    var denom=c*sxx-sx*sx;
+    if(denom===0) return 0;
+    return (c*sxy-sx*sy)/denom/dt;
+  }
+
+  function poseDist(p,q){
+    var dx=p.x-q.x, dy=p.y-q.y;
+    return Math.sqrt(dx*dx+dy*dy);
+  }
+
+  // opts の正規化: {hand:'right'|'left', direction:+1|-1}
+  function poseNormalizeOpts(opts){
+    opts=opts||{};
+    var hand=opts.hand==='left'?'left':'right';
+    var direction=opts.direction===-1?-1:1;
+    return {hand:hand, direction:direction};
+  }
+
+  // フレーム列を時刻順にソートし、必要ランドマークが欠けたフレームを捨てる（足首はフォールバック用に必須のまま）
+  function posePrepareFrames(frames, opts){
+    var need=['Ankle','Wrist','Shoulder','Hip']; // 両サイド分
+    var out=[], i, f, lm, ok, k;
+    var sides=['left','right'];
+    if(!frames || !frames.length) return out;
+    for(i=0;i<frames.length;i++){
+      f=frames[i];
+      if(!f || !poseIsFiniteNum(f.t) || !f.landmarks) continue;
+      lm=f.landmarks; ok=true;
+      for(var s=0;s<sides.length;s++){
+        for(var w=0;w<need.length;w++){
+          k=sides[s]+need[w];
+          if(!lm[k] || !poseIsFiniteNum(lm[k].x) || !poseIsFiniteNum(lm[k].y)){ ok=false; break; }
+        }
+        if(!ok) break;
+      }
+      if(ok) out.push({t:f.t, landmarks:lm});
+    }
+    out.sort(function(a,b){ return a.t-b.t; });
+    return out;
+  }
+
+  function poseSeriesOf(frames, key){
+    var xs=[], ys=[], ts=[], i, p;
+    for(i=0;i<frames.length;i++){
+      p=frames[i].landmarks[key];
+      xs.push(p.x); ys.push(p.y); ts.push(frames[i].t);
+    }
+    return {x:xs, y:ys, t:ts};
+  }
+
+  function poseDtOf(frames){
+    if(frames.length<2) return 0;
+    return (frames[frames.length-1].t-frames[0].t)/(frames.length-1);
+  }
+
+  // ストライド足の床接触に近い方の y 列をフレームごとに返す。
+  // heel（踵）と foot_index（つま先）が両方あれば y 下向き正なので大きい方（床に近い方）を優先して使い、
+  // 無いフレームでは足首(Ankle)にフォールバックする
+  function poseStrideFootYSeries(fr, side){
+    var out=new Array(fr.length), i, lm, heel, fi, ank;
+    for(i=0;i<fr.length;i++){
+      lm=fr[i].landmarks;
+      heel=lm[side+'Heel']; fi=lm[side+'FootIndex']; ank=lm[side+'Ankle'];
+      if(heel && fi && poseIsFiniteNum(heel.y) && poseIsFiniteNum(fi.y)) out[i]=Math.max(heel.y, fi.y);
+      else if(ank && poseIsFiniteNum(ank.y)) out[i]=ank.y;
+      else out[i]=NaN;
+    }
+    return out;
+  }
+
+  // ヒンジ（折れ線）フィット: y = a + b*(i-h) (i<h), y = a (i>=h) の折れ点 h を SSE 最小で探索する
+  function poseHingeFit(ys, i0, W){
+    var n=ys.length;
+    var a0=Math.max(0,i0-W), b0=Math.min(n-1,i0+W);
+    var bestH=i0, bestSse=Infinity;
+    var h, i, j;
+    for(h=a0; h<=b0; h++){
+      var s11=0, s12=0, s1y=0, s22=0, s2y=0;
+      for(i=a0;i<=b0;i++){
+        var x=(i<h)?(i-h):0;
+        s11+=1; s12+=x; s1y+=ys[i]; s22+=x*x; s2y+=x*ys[i];
+      }
+      var d=s11*s22-s12*s12;
+      if(d===0) continue;
+      var b=(s11*s2y-s12*s1y)/d;
+      var a=(s22*s1y-s12*s2y)/d;
+      var sse=0;
+      for(j=a0;j<=b0;j++){
+        var xj=(j<h)?(j-h):0;
+        var r=ys[j]-a-b*xj;
+        sse+=r*r;
+      }
+      if(sse<bestSse){ bestSse=sse; bestH=h; }
+    }
+    return bestH;
+  }
+
+  // 前方速度ピーク付近に最小二乗放物線を当てはめ、サブフレームで頂点を返す
+  function poseLsqPeak(ys, i0, K){
+    var n=ys.length;
+    var a=Math.max(1,i0-K), b=Math.min(n-2,i0+K);
+    var s0=0,s1=0,s2=0,s3=0,s4=0,t0=0,t1=0,t2=0;
+    var i, x, y;
+    for(i=a;i<=b;i++){
+      x=i-i0; y=ys[i];
+      s0+=1; s1+=x; s2+=x*x; s3+=x*x*x; s4+=x*x*x*x;
+      t0+=y; t1+=x*y; t2+=x*x*y;
+    }
+    // y = c0 + c1*x + c2*x^2 の正規方程式を3x3ガウス消去で解く
+    var A=[[s0,s1,s2,t0],[s1,s2,s3,t1],[s2,s3,s4,t2]];
+    var c, r, k, p;
+    for(c=0;c<3;c++){
+      p=c;
+      for(r=c+1;r<3;r++) if(Math.abs(A[r][c])>Math.abs(A[p][c])) p=r;
+      var tmp=A[c]; A[c]=A[p]; A[p]=tmp;
+      if(Math.abs(A[c][c])<1e-12) return i0;
+      for(r=c+1;r<3;r++){
+        var f=A[r][c]/A[c][c];
+        for(k=c;k<4;k++) A[r][k]-=f*A[c][k];
+      }
+    }
+    var coef=[0,0,0];
+    for(r=2;r>=0;r--){
+      var s=A[r][3];
+      for(k=r+1;k<3;k++) s-=A[r][k]*coef[k];
+      coef[r]=s/A[r][r];
+    }
+    if(coef[2]<0){
+      var off=-coef[1]/(2*coef[2]);
+      if(Math.abs(off)<=K) return i0+off;
+    }
+    return i0;
+  }
+
+  // フレーム index（小数可）から時刻を線形補間で得る
+  function poseTAt(fr, h){
+    var n=fr.length;
+    if(h<=0) return fr[0].t;
+    if(h>=n-1) return fr[n-1].t;
+    var i0=Math.floor(h), f=h-i0;
+    return fr[i0].t + f*(fr[i0+1].t-fr[i0].t);
+  }
+
+  // ---- 軸足接地検出 ----
+  // ストライド足 = 利き腕の逆側の足。足の y（heel/foot_index 優先、無ければ足首。下向き正）が極大付近で
+  // 垂直速度が下向き(+) → ほぼゼロに転じる点を接地候補とし、接地後に「床付近に滞在する長さ(dwell)」が
+  // 最も長い候補を選び、ヒンジフィットで角点をサブフレーム精度に詰める。
+  // 戻り値: { t, index, dwellFrames, candidates:[{t,index,dwellFrames}] } または null
+  function poseDetectFootContact(frames, opts){
+    var o=poseNormalizeOpts(opts);
+    var fr=posePrepareFrames(frames, o);
+    if(fr.length<5) return null;
+    var side=(o.hand==='right'?'left':'right');
+    var dt=poseDtOf(fr);
+    if(dt<=0) return null;
+
+    var ys=poseMovingAverage(poseStrideFootYSeries(fr, side), 1); // 軽いノイズ低減（窓3）
+    var n=ys.length;
+    var vy=new Array(n);
+    var i;
+    for(i=0;i<n;i++) vy[i]=poseSlopeAt(ys, i, 3, dt); // + = 下降（y下向き正）
+
+    var yMax=-Infinity, yMin=Infinity;
+    for(i=0;i<n;i++){ if(ys[i]>yMax) yMax=ys[i]; if(ys[i]<yMin) yMin=ys[i]; }
+    var range=yMax-yMin;
+    if(range<=0) return null;
+    var vMax=0;
+    for(i=0;i<n;i++){ if(vy[i]>vMax) vMax=vy[i]; }
+    if(vMax<=0) return null; // 一度も下降していない
+
+    var yThr=yMax-0.25*range;     // 「極大付近」= 最大値から range の25%以内
+    var vDesc=0.20*vMax;          // 十分に下降していること
+    var vStop=0.18*vMax;          // ほぼゼロに転じたこと
+    var dwellThr=yMax-0.40*range; // 滞在判定: 床付近に留まっているか
+
+    // 下降を検出した後「初めて」速度がほぼゼロに転じた点を接地候補にする
+    var candidates=[];
+    var seenDesc=false;
+    for(i=1;i<n;i++){
+      if(vy[i]>=vDesc) seenDesc=true;
+      if(seenDesc && vy[i]<=vStop && ys[i]>=yThr){
+        // dwell: この先どれだけ床付近に留まるか
+        var dwell=0;
+        var j;
+        for(j=i+1;j<n && ys[j]>=dwellThr;j++) dwell++;
+        candidates.push({t:fr[i].t, index:i, dwellFrames:dwell});
+      }
+    }
+    if(!candidates.length) return null;
+
+    // 最も確からしい1つ = 接地後の滞在が最も長いもの（同率なら最も早いもの）
+    var best=candidates[0];
+    for(i=1;i<candidates.length;i++){
+      var c=candidates[i];
+      if(c.dwellFrames>best.dwellFrames ||
+         (c.dwellFrames===best.dwellFrames && c.index<best.index)) best=c;
+    }
+    // ヒンジフィットで接地角点を詰める（±14フレーム窓）
+    var h=poseHingeFit(ys, best.index, 14);
+    return {t:fr[h].t, index:h, dwellFrames:best.dwellFrames, candidates:candidates};
+  }
+
+  // ---- リリース候補検出 ----
+  // 利き腕手首の前方速度（x方向 × direction）が最大になる付近を第一候補とし、
+  // 肘伸展の代理指標（肩-手首距離 / 体幹長 = 腕の伸び具合）が高い候補を優先する。
+  // 速度ピークは最小二乗放物線でサブフレーム補間する。
+  // 戻り値: { t, index, forwardSpeed, extension, candidates:[...] } または null
+  // （あくまで候補区間の推定であり、真のリリース時刻の断定ではない）
+  function poseDetectReleaseCandidate(frames, opts){
+    var o=poseNormalizeOpts(opts);
+    var fr=posePrepareFrames(frames, o);
+    if(fr.length<5) return null;
+    var wristKey=o.hand+'Wrist';
+    var shoulderKey=o.hand+'Shoulder';
+    var hipKey=o.hand+'Hip';
+    var s=poseSeriesOf(fr, wristKey);
+    var sh=poseSeriesOf(fr, shoulderKey);
+    var hip=poseSeriesOf(fr, hipKey);
+    var dt=poseDtOf(fr);
+    if(dt<=0) return null;
+
+    var xs=poseMovingAverage(s.x, 2);
+    var n=xs.length;
+    var fwd=new Array(n);   // 前方速度（投球方向正）
+    var ext=new Array(n);   // 腕の伸び具合
+    var i;
+    for(i=0;i<n;i++){
+      fwd[i]=o.direction*poseSlopeAt(xs, i, 3, dt);
+      var torso=poseDist({x:sh.x[i], y:sh.y[i]}, {x:hip.x[i], y:hip.y[i]});
+      ext[i]=torso>0 ? poseDist({x:sh.x[i], y:sh.y[i]}, {x:s.x[i], y:s.y[i]})/torso : 0;
+    }
+    var extS=poseMovingAverage(ext, 2);
+
+    var fMax=-Infinity;
+    for(i=0;i<n;i++) if(fwd[i]>fMax) fMax=fwd[i];
+    if(!(fMax>0)) return null; // 前方へ動いていない
+
+    var eMax=-Infinity, eMin=Infinity;
+    for(i=0;i<n;i++){ if(extS[i]>eMax) eMax=extS[i]; if(extS[i]<eMin) eMin=extS[i]; }
+    var eThr=eMin+0.60*(eMax-eMin); // 肘（腕）が十分伸びている候補だけ残す
+
+    // 局所最大かつ最大の50%以上のものを候補に
+    var peaks=[];
+    for(i=1;i<n-1;i++){
+      if(fwd[i]>=fwd[i-1] && fwd[i]>=fwd[i+1] && fwd[i]>=0.5*fMax){
+        peaks.push({t:fr[i].t, index:i, forwardSpeed:fwd[i], extension:extS[i]});
+      }
+    }
+    if(!peaks.length){
+      // 局所最大が取れない場合（端付近など）は全体の argmax にフォールバック
+      var bi=0;
+      for(i=1;i<n;i++) if(fwd[i]>fwd[bi]) bi=i;
+      peaks.push({t:fr[bi].t, index:bi, forwardSpeed:fwd[bi], extension:extS[bi]});
+    }
+    var eligible=[];
+    for(i=0;i<peaks.length;i++) if(peaks[i].extension>=eThr) eligible.push(peaks[i]);
+    if(!eligible.length) eligible=peaks; // 伸展条件を満たす候補が無ければ速度のみで決める
+
+    var best=eligible[0];
+    for(i=1;i<eligible.length;i++) if(eligible[i].forwardSpeed>best.forwardSpeed) best=eligible[i];
+    // サブフレームで速度ピークを詰める
+    var h=poseLsqPeak(fwd, best.index, 7);
+    return {t:poseTAt(fr, h), index:h, forwardSpeed:best.forwardSpeed, extension:best.extension, candidates:peaks};
+  }
+
+  // ---- テンポ計算 ----
+  // 戻り値: { footContactT, footContactIndex, releaseT, releaseIndex, tempoSec, reason }
+  // 検出できなければ該当フィールド null ＋ reason に理由を入れる
+  function poseComputeTempo(frames, opts){
+    var fc=poseDetectFootContact(frames, opts);
+    var rc=poseDetectReleaseCandidate(frames, opts);
+    var out={
+      footContactT:fc?fc.t:null,
+      footContactIndex:fc?fc.index:null,
+      releaseT:rc?rc.t:null,
+      releaseIndex:rc?rc.index:null,
+      tempoSec:null,
+      reason:'ok'
+    };
+    if(!fc && !rc){ out.reason='foot-contact-and-release-not-detected'; return out; }
+    if(!fc){ out.reason='foot-contact-not-detected'; return out; }
+    if(!rc){ out.reason='release-not-detected'; return out; }
+    if(rc.t<=fc.t){ out.reason='release-not-after-foot-contact'; return out; }
+    out.tempoSec=rc.t-fc.t;
+    return out;
+  }
+
+  /* ---- Phase 2 合成テスト用: 投球動作を模したランドマーク列の生成（純粋関数。PoCの synthesizeThrow と同一） ----
+     footPts:true を付けると heel（踵）/ foot_index（つま先）ランドマークも付与し、
+     接地判定の heel/foot_index 優先経路を検証できる（無い場合は足首フォールバック） */
+  function poseMulberry32(seed){
+    var a=seed>>>0;
+    return function(){
+      a|=0; a=(a+0x6D2B79F5)|0;
+      var t=Math.imul(a^(a>>>15),1|a);
+      t=(t+Math.imul(t^(t>>>7),61|t))^t;
+      return ((t^(t>>>14))>>>0)/4294967296;
+    };
+  }
+  function poseGauss(rnd){ // Box-Muller
+    var u=0, v=0;
+    while(u===0) u=rnd();
+    v=rnd();
+    return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+  }
+  function poseSmoothstep(u){ u=poseClamp(u,0,1); return u*u*(3-2*u); }
+  function poseSigmoid(u){ return 1/(1+Math.exp(-u)); }
+
+  // 真横から見た投球を模擬（右利き・+x方向投球を正準形として生成し、hand/direction に応じて左右反転・x反転）
+  function poseSynthesizeThrow(o){
+    o=o||{};
+    var fps=o.fps||240;
+    var duration=o.duration||1.2;
+    var contactT=(o.contactT!=null)?o.contactT:0.60;
+    var releaseT=(o.releaseT!=null)?o.releaseT:0.90;
+    var hand=o.hand==='left'?'left':'right';
+    var direction=o.direction===-1?-1:1;
+    var noise=o.noise||0;
+    var seed=o.seed||1;
+    var footPts=o.footPts===true;
+    var rnd=poseMulberry32(seed);
+
+    var n=Math.round(duration*fps)+1;
+    var frames=[];
+    var t;
+    for(var i=0;i<n;i++){
+      t=i/fps;
+      // --- ストライド足（正準形では左足）: 振り出し後、短時間で急接地し滞在 ---
+      var tSwing=contactT-0.20;  // 振り出し開始
+      var tPlant=contactT-0.05;   // 急接地フェーズ開始
+      var strideY;
+      if(t<tPlant) strideY=0.66+0.10*poseSmoothstep((t-tSwing)/(tPlant-tSwing));
+      else strideY=0.76+0.04*poseSmoothstep((t-tPlant)/(contactT-tPlant));
+      var strideX=0.38+0.14*poseSmoothstep((t-tSwing)/(contactT-tSwing));
+      // --- 投球腕の手首: 後方から前方へ加速し、releaseT で速度最大、以後減速 ---
+      var wristX=0.30+0.55*poseSigmoid((t-releaseT)/0.025);
+      var wristY=0.58-0.08*poseSmoothstep((t-(releaseT-0.40))/0.40);
+      // --- 体幹など ---
+      var shX=0.48+0.04*poseSmoothstep((t-contactT)/0.20);
+      var rightAnkleY=0.80;
+      var lm={
+        leftAnkle:{x:strideX, y:strideY},
+        rightAnkle:{x:0.30+0.02*poseSmoothstep((t-contactT)/0.30), y:rightAnkleY},
+        leftWrist:{x:0.42+0.03*poseSmoothstep(t/duration), y:0.62-0.02*poseSmoothstep(t/duration)},
+        rightWrist:{x:wristX, y:wristY},
+        leftShoulder:{x:shX-0.04, y:0.36},
+        rightShoulder:{x:shX, y:0.35},
+        leftHip:{x:shX-0.04, y:0.59},
+        rightHip:{x:shX-0.02, y:0.58}
+      };
+      if(footPts){
+        // 踵・つま先は足首より床に近い（yが大きい）位置に置く
+        lm.leftHeel={x:strideX, y:strideY+0.015};
+        lm.leftFootIndex={x:strideX+0.01, y:strideY+0.028};
+        lm.rightHeel={x:lm.rightAnkle.x, y:rightAnkleY+0.015};
+        lm.rightFootIndex={x:lm.rightAnkle.x+0.01, y:rightAnkleY+0.028};
+      }
+      if(noise>0){
+        for(var k in lm){
+          lm[k].x+=poseGauss(rnd)*noise;
+          lm[k].y+=poseGauss(rnd)*noise;
+        }
+      }
+      // 利き腕が left なら左右を入れ替え、direction=-1 なら x を反転
+      if(hand==='left'){
+        var swap=['Ankle','Wrist','Shoulder','Hip'];
+        if(footPts) swap.push('Heel','FootIndex');
+        var tmp={};
+        for(var k2 in lm){
+          var m=/^(left|right)(Ankle|Wrist|Shoulder|Hip|Heel|FootIndex)$/.exec(k2);
+          if(m && swap.indexOf(m[2])>=0) tmp[(m[1]==='left'?'right':'left')+m[2]]=lm[k2];
+          else tmp[k2]=lm[k2];
+        }
+        lm=tmp;
+      }
+      if(direction===-1){
+        for(var k3 in lm) lm[k3].x=1-lm[k3].x;
+      }
+      frames.push({t:t, landmarks:lm});
+    }
+    return {
+      frames:frames,
+      truth:{contactT:contactT, releaseT:releaseT, tempoSec:releaseT-contactT, fps:fps, hand:hand, direction:direction, noise:noise, seed:seed, footPts:footPts}
+    };
+  }
+
+  // ---- Phase 2 自己テスト（PoCの pose-events.js selfTest と同一シナリオ＋ heel/foot_index 優先経路の検証） ----
+  // node work/app-scripts.test.js から KYU.poseSelfTest() として実行する
+  function poseSelfTest(){
+    var TOL_FRAMES=2; // 真値 ±2 フレーム以内
+    var scenarios=[], i;
+    // 1: クリーン（右利き・+x・240fps）
+    scenarios.push({name:'clean right/+x 240fps', opts:{fps:240, contactT:0.60, releaseT:0.90, hand:'right', direction:1, noise:0, seed:1}});
+    // 2: ノイズ σ=0.005 を複数シードで
+    for(i=1;i<=20;i++){
+      scenarios.push({name:'noise0.005 right/+x 240fps seed='+i, opts:{fps:240, contactT:0.60, releaseT:0.90, hand:'right', direction:1, noise:0.005, seed:i}});
+    }
+    // 3: ノイズあり・左利き・-x方向（鏡像）
+    for(i=1;i<=10;i++){
+      scenarios.push({name:'noise0.005 left/-x 240fps seed='+(100+i), opts:{fps:240, contactT:0.60, releaseT:0.90, hand:'left', direction:-1, noise:0.005, seed:100+i}});
+    }
+    // 4: 別タイミング・120fps
+    for(i=1;i<=10;i++){
+      scenarios.push({name:'noise0.005 right/+x 120fps t=0.50/0.75 seed='+(200+i), opts:{fps:120, contactT:0.50, releaseT:0.75, hand:'right', direction:1, noise:0.005, seed:200+i}});
+    }
+    // 5: heel/foot_index 優先経路（footPts:true の合成列。踵・つま先ランドマーク付き）
+    for(i=1;i<=10;i++){
+      scenarios.push({name:'footPts noise0.005 right/+x 240fps seed='+(300+i), opts:{fps:240, contactT:0.60, releaseT:0.90, hand:'right', direction:1, noise:0.005, seed:300+i, footPts:true}});
+    }
+    for(i=1;i<=5;i++){
+      scenarios.push({name:'footPts noise0.005 left/-x 240fps seed='+(400+i), opts:{fps:240, contactT:0.60, releaseT:0.90, hand:'left', direction:-1, noise:0.005, seed:400+i, footPts:true}});
+    }
+
+    var results=[], allPass=true;
+    for(i=0;i<scenarios.length;i++){
+      var sc=scenarios[i];
+      var syn=poseSynthesizeThrow(sc.opts);
+      var det=poseComputeTempo(syn.frames, {hand:syn.truth.hand, direction:syn.truth.direction});
+      var fps=syn.truth.fps;
+      var cErrF=(det.footContactT!=null)?Math.abs(det.footContactT-syn.truth.contactT)*fps:Infinity;
+      var rErrF=(det.releaseT!=null)?Math.abs(det.releaseT-syn.truth.releaseT)*fps:Infinity;
+      var tErrF=(det.tempoSec!=null)?Math.abs(det.tempoSec-syn.truth.tempoSec)*fps:Infinity;
+      var EPS=1e-9;
+      var pass=(cErrF<=TOL_FRAMES+EPS && rErrF<=TOL_FRAMES+EPS && tErrF<=TOL_FRAMES*2+EPS);
+      if(!pass) allPass=false;
+      results.push({
+        name:sc.name, pass:pass,
+        footContactErrFrames:cErrF===Infinity?null:+cErrF.toFixed(2),
+        releaseErrFrames:rErrF===Infinity?null:+rErrF.toFixed(2),
+        tempoErrFrames:tErrF===Infinity?null:+tErrF.toFixed(2),
+        detected:{footContactT:det.footContactT, releaseT:det.releaseT, tempoSec:det.tempoSec, reason:det.reason}
+      });
+    }
+    // 集計
+    var groups={};
+    for(i=0;i<results.length;i++){
+      var g=results[i].name.replace(/seed=\d+$/,'').trim();
+      (groups[g]=groups[g]||[]).push(results[i]);
+    }
+    var summary=[];
+    for(var gname in groups){
+      var arr=groups[gname];
+      var mc=0, mr=0, mt=0, npass=0;
+      for(i=0;i<arr.length;i++){
+        if(arr[i].footContactErrFrames!=null) mc=Math.max(mc, arr[i].footContactErrFrames);
+        if(arr[i].releaseErrFrames!=null) mr=Math.max(mr, arr[i].releaseErrFrames);
+        if(arr[i].tempoErrFrames!=null) mt=Math.max(mt, arr[i].tempoErrFrames);
+        if(arr[i].pass) npass++;
+      }
+      summary.push({group:gname, n:arr.length, pass:npass+'/'+arr.length, maxFootContactErrFrames:mc, maxReleaseErrFrames:mr, maxTempoErrFrames:mt});
+    }
+    return {toleranceFrames:TOL_FRAMES, allPass:allPass, summary:summary, details:results};
+  }
+
   return {
     SAMPLE_MS:SAMPLE_MS, TRIG_MIN:TRIG_MIN, TRIG_RATIO:TRIG_RATIO, TRIG_STREAK:TRIG_STREAK,
     QUIET_ABS:QUIET_ABS, QUIET_RATIO:QUIET_RATIO, QUIET_MS:QUIET_MS, MAX_REC_MS:MAX_REC_MS, ARM_MS:ARM_MS,
@@ -2239,7 +2722,9 @@ var KYU=(function(){
     FINE_MIN_PX:FINE_MIN_PX, FINE_MAX_GAP:FINE_MAX_GAP, FINE_RETRY_MAX:FINE_RETRY_MAX, QUIET_SEC:QUIET_SEC,
     centroidFromDiff:centroidFromDiff, centroidFromCrop:centroidFromCrop, centroidAround:centroidAround,
     pickQuietFrame:pickQuietFrame, blobCentroid:blobCentroid, buildTrajSamples:buildTrajSamples,
-    refineBallPath:refineBallPath, extractBallPathStaged:extractBallPathStaged
+    refineBallPath:refineBallPath, extractBallPathStaged:extractBallPathStaged,
+    poseDetectFootContact:poseDetectFootContact, poseDetectReleaseCandidate:poseDetectReleaseCandidate,
+    poseComputeTempo:poseComputeTempo, poseSynthesizeThrow:poseSynthesizeThrow, poseSelfTest:poseSelfTest
   };
 })();
 if(typeof module!=='undefined' && module.exports){ module.exports=KYU; }
@@ -2282,7 +2767,7 @@ var els={
   listDate:$('listDate'), stats:$('stats'), recordList:$('recordList'), toast:$('toast')
 };
 
-var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null, voiceOn:true, calib:{active:false, points:[], source:null, advanceM:null, pxPerM:null}, lastIvb:null };
+var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null, voiceOn:true, calib:{active:false, points:[], source:null, advanceM:null, pxPerM:null}, lastIvb:null, poseHand:'right', poseResult:null };
 var q={ stream:null, starting:false, monitor:null, prev:null, gate:KYU.newGate(),
       mode:'off', mediaRec:null, chunks:[], mime:'', recStartAt:0, blob:null, recId:null, arrivalSource:'', analyzeUrl:null };
 var objectUrl=null;
@@ -2314,7 +2799,7 @@ function loadAll(){ try{ var d=JSON.parse(localStorage.getItem(LS_KEY)); return 
 function saveAll(d){ try{ localStorage.setItem(LS_KEY, JSON.stringify(d)); }catch(e){ toast('保存に失敗しました（容量不足の可能性があります）'); } }
 function loadQuickSettings(){ try{ var d=JSON.parse(localStorage.getItem(QLS_KEY)); return (d&&typeof d==='object')?d:{}; }catch(e){ return {}; } }
 function saveQuickSettings(){
-  try{ localStorage.setItem(QLS_KEY, JSON.stringify({dist:state.distPreset, custom:state.customDist, corr:state.correction, name:els.qPlayerName.value, height:state.heightCm, camDist:state.camDistM, voice:state.voiceOn})); }catch(e){}
+  try{ localStorage.setItem(QLS_KEY, JSON.stringify({dist:state.distPreset, custom:state.customDist, corr:state.correction, name:els.qPlayerName.value, height:state.heightCm, camDist:state.camDistM, voice:state.voiceOn, poseHand:state.poseHand})); }catch(e){}
 }
 
 function toast(msg){
@@ -2862,6 +3347,7 @@ els.video.addEventListener('loadedmetadata', function(){
   setControlsEnabled(true);
   if(batchEls) batchEls.start.disabled=false; // 一括解析の開始ボタンを有効化
   updateCalibUI(); // タップ校正ボタンの有効/状態を動画読み込みに合わせる
+  updatePoseUI();  // フォーム解析ボタンの有効/無効を動画読み込みに合わせる
   updateFrameUI(); updateMarks(); updateResult();
 });
 els.video.addEventListener('timeupdate', function(){
@@ -3516,6 +4002,7 @@ function updateResult(){
   els.saveBtn.disabled = r.status!=='ok';
   els.shareCurrentBtn.disabled = r.status!=='ok';
   updateTrajUI(); // 軌道抽出ボタンの有効/無効（リリース点・到達点の設定状態に追従）
+  updatePoseUI(); // フォーム解析ボタンの有効/無効（動画読み込み・リリース点の設定状態に追従）
   renderQuickResult();
 }
 
@@ -3537,6 +4024,12 @@ function makeRecord(r, o){
   if(o.videoTime!=null) rec.videoTime=o.videoTime; // 一括解析: 動画内時刻(秒)
   // Phase 3-B: 終速 plateKmh を保存。ivbCm は軌道抽出がゲート合格した記録のみ保存する
   if(typeof r.plateKmh==='number' && isFinite(r.plateKmh)) rec.plateKmh=r.plateKmh;
+  // Phase 2: フォーム解析（実験）でテンポが計算できた場合は tempoSec として記録へ含める
+  // （現リリースマークに対して解析した結果に限定。マーク変更後の古い結果は記録に混ぜない）
+  if(state.poseResult && typeof state.poseResult.tempoSec==='number' && isFinite(state.poseResult.tempoSec) &&
+     state.poseResult.centerReleaseTime===state.releaseTime){
+    rec.tempoSec=state.poseResult.tempoSec;
+  }
   if(typeof o.ivbCm==='number' && isFinite(o.ivbCm)){
     rec.ivbCm=o.ivbCm;
   }else if(state.lastIvb && state.lastIvb.pass && typeof state.lastIvb.ivbCm==='number' &&
@@ -4124,6 +4617,229 @@ function runTrajectoryExtraction(){
   });
 }
 
+/* ---- Phase 2: 姿勢推定によるフォーム解析（実験）（詳細モード・JS生成UI。HTMLは無変更） ----
+   ねらい: MediaPipe Pose Landmarker（lite）で読み込んだ動画の当該投球区間（リリースマーク中心・初期値 前2秒/後1秒）を
+   フレームごとに推論してランドマーク列を作り、KYU の姿勢イベント検出（poseComputeTempo。work/pose-events.js の
+   PoCロジックを移植済み）で軸足接地・リリース候補（推定）・テンポを推定する。
+   結果はこのカード内だけに表示し、結果パネルの12タイルは変更しない。テンポが出れば記録保存時に tempoSec として記録へ含める。
+   ライブラリ/モデル/WASMはCDN（jsdelivr / storage.googleapis.com）から実行時に動的読み込みする。
+   CDN読み込み失敗時はこのカード内にエラーを表示するだけで、アプリ本体は落とさない。
+   真横から撮影した「画像の右向き(+x)に投げる」映像を想定（direction=+1 固定。利き腕のみ選択式）。 */
+var POSE_CDN_VERSIONS=['1.2.3','0.10.14']; // PARTS.md記載の1.2.3を優先、フォールバックあり
+var POSE_MODEL_URL='https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+// BlazePose 33点のうち必要なランドマークのインデックス（接地判定で優先する heel/foot_index を含む）
+var POSE_IDX={
+  leftShoulder:11, rightShoulder:12, leftElbow:13, rightElbow:14,
+  leftWrist:15, rightWrist:16, leftHip:23, rightHip:24,
+  leftAnkle:27, rightAnkle:28, leftHeel:29, rightHeel:30,
+  leftFootIndex:31, rightFootIndex:32
+};
+var POSE_PRE_SEC=2;  // リリースマーク中心の処理区間・前（秒）の初期値
+var POSE_POST_SEC=1; // リリースマーク中心の処理区間・後（秒）の初期値
+var poseEls=null;
+var poseLibCache=null;   // {pkg, wasmBase, ver}（一度読めば使い回す）
+var poseLandmarker=null; // 実行中の Landmarker（終わったら close する）
+var poseRunning=false;
+
+// tasks-vision を CDN から動的 import する（バージョン優先＋フォールバック）。全滅したら reject
+function poseLoadLib(){
+  if(poseLibCache) return Promise.resolve(poseLibCache);
+  var lastErr=null, i=0;
+  function tryOne(){
+    if(i>=POSE_CDN_VERSIONS.length) return Promise.reject(lastErr || new Error('CDN load failed'));
+    var v=POSE_CDN_VERSIONS[i++];
+    var url='https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@'+v;
+    return import(url).then(function(pkg){
+      poseLibCache={pkg:pkg, wasmBase:url+'/wasm', ver:v};
+      return poseLibCache;
+    }, function(e){ lastErr=e; return tryOne(); });
+  }
+  return tryOne();
+}
+
+// BlazePose 33点から必要ランドマークだけを {key:{x,y}} に抽出（x,y が非有限のものは載せない）
+function posePickLandmarks(lm33){
+  var out={}, k, p;
+  if(!lm33) return out;
+  for(k in POSE_IDX){
+    p=lm33[POSE_IDX[k]];
+    if(p && isFinite(p.x) && isFinite(p.y)) out[k]={x:p.x, y:p.y};
+  }
+  return out;
+}
+
+function buildPoseUI(){
+  if(poseEls) return;
+  var card=document.createElement('div');
+  card.className='card'; card.id='poseCard';
+  card.innerHTML=
+    '<h2>フォーム解析（実験）</h2>'+
+    '<p class="muted small">MediaPipe Pose Landmarker（liteモデル）をCDNから動的に読み込み、読み込んだ動画をシークしながらリリースマーク中心の区間（初期値: 前'+POSE_PRE_SEC+'秒・後'+POSE_POST_SEC+'秒）をフレームごとに推論して姿勢ランドマーク列を作り、軸足接地時刻・リリース候補（推定）時刻・テンポ（接地→リリース候補）を推定します。結果はこのカード内だけに表示し、結果パネルのタイルには反映しません。真横から撮影した右方向（画像の+x方向）へ投げる映像を想定しています。CDN（jsdelivr / storage.googleapis.com）にアクセスできない環境では、このカード内にエラーを表示するだけでアプリ本体は動作し続けます。</p>'+
+    '<div class="mark-row" style="margin-top:8px">'+
+      '<label class="small">利き腕 <select id="poseHandSel"><option value="right">右投げ</option><option value="left">左投げ</option></select></label>'+
+      '<label class="small">処理区間: リリース前 <input type="number" id="posePreSec" value="'+POSE_PRE_SEC+'" min="0.5" max="10" step="0.5" style="width:56px"> 秒 ・ 後 <input type="number" id="posePostSec" value="'+POSE_POST_SEC+'" min="0.5" max="10" step="0.5" style="width:56px"> 秒</label>'+
+    '</div>'+
+    '<div class="mark-row" style="margin-top:8px">'+
+      '<button class="btn btn-primary" id="poseStartBtn" disabled>フォーム解析を実行</button>'+
+    '</div>'+
+    '<progress id="poseBar" max="100" value="0" style="width:100%;margin-top:8px" hidden></progress>'+
+    '<div id="poseProgress" class="muted small" style="margin-top:4px" hidden></div>'+
+    '<p id="poseErr" class="err" style="margin-top:6px;white-space:pre-wrap"></p>'+
+    '<div id="poseResult" class="small" style="margin-top:6px"></div>';
+  var anchor=(trajEls && trajEls.card) || els.video.closest('.card'); // 軌道抽出カードの直後に挿入
+  (anchor && anchor.parentNode ? anchor.parentNode : els.detailView).insertBefore(card, anchor ? anchor.nextSibling : null);
+  poseEls={
+    card:card, hand:$('poseHandSel'), pre:$('posePreSec'), post:$('posePostSec'),
+    start:$('poseStartBtn'), bar:$('poseBar'), progress:$('poseProgress'), err:$('poseErr'), result:$('poseResult')
+  };
+  poseEls.hand.value=state.poseHand;
+  poseEls.hand.addEventListener('change', function(){ // 利き腕は設定として保存する
+    state.poseHand=(poseEls.hand.value==='left')?'left':'right';
+    saveQuickSettings();
+  });
+  poseEls.start.addEventListener('click', function(){ runPoseAnalysis(); });
+  updatePoseUI();
+}
+function updatePoseUI(){
+  if(!poseEls) return;
+  poseEls.start.disabled = !(state.loaded && state.releaseTime!=null && !poseRunning);
+}
+function setPoseProgress(pct, msg){
+  if(!poseEls) return;
+  poseEls.bar.hidden=false; poseEls.bar.value=pct;
+  poseEls.progress.hidden=false; poseEls.progress.textContent=msg;
+}
+// 検出結果をカード内へ表示（リリース候補は「候補区間の推定」であることを明示＋各フレームへシークできるボタン付き）
+function poseRenderResult(res){
+  if(!poseEls || !res) return;
+  var f=function(t){ return (t==null) ? '—' : 'F'+pad(frameNoOf(t),4)+'（'+t.toFixed(3)+'s）'; };
+  var tempo=(typeof res.tempoSec==='number' && isFinite(res.tempoSec))
+    ? (res.tempoSec*1000).toFixed(1)+' ms（'+res.tempoSec.toFixed(3)+' s）'
+    : '算出不可（'+res.reason+'）';
+  poseEls.result.innerHTML=
+    '<div class="rec-top"><span class="rec-name">軸足接地時刻</span><span class="rec-kmh">'+f(res.footContactT)+'</span></div>'+
+    '<div class="rec-top"><span class="rec-name">リリース候補（推定）時刻</span><span class="rec-kmh">'+f(res.releaseT)+'</span></div>'+
+    '<div class="rec-top"><span class="rec-name">テンポ（接地→リリース候補）</span><span class="rec-kmh">'+tempo+'</span></div>'+
+    '<p class="muted small" style="margin-top:4px">※「リリース候補（推定）」は候補区間の推定値です（利き腕手首の前方速度ピーク＋腕伸展からの推定。真のリリース断定ではありません）。'+
+      'ランドマーク取得 '+(res.validCount!=null?res.validCount:'?')+'/'+(res.frameCount!=null?res.frameCount:'?')+' フレーム ・ 利き腕 '+(res.hand==='left'?'左投げ':'右投げ')+
+      ' ・ 区間 リリース前'+(res.preSec!=null?res.preSec:POSE_PRE_SEC)+'s・後'+(res.postSec!=null?res.postSec:POSE_POST_SEC)+'s（実効 '+(res.fps!=null?res.fps.toFixed(1):'-')+'fps）</p>'+
+    '<div class="mark-row" style="margin-top:6px">'+
+      '<button class="btn btn-small" id="poseSeekContactBtn"'+(res.footContactT==null?' disabled':'')+'>接地フレームへシーク</button>'+
+      '<button class="btn btn-small" id="poseSeekReleaseBtn"'+(res.releaseT==null?' disabled':'')+'>リリース候補フレームへシーク</button>'+
+    '</div>';
+  var cb=$('poseSeekContactBtn'), rb=$('poseSeekReleaseBtn');
+  if(cb) cb.addEventListener('click', function(){ if(res.footContactT!=null) poseSeekTo(res.footContactT); });
+  if(rb) rb.addEventListener('click', function(){ if(res.releaseT!=null) poseSeekTo(res.releaseT); });
+}
+// 検出イベントのフレームへシーク（既存のシーク/コマ送りUIに追従させる）
+function poseSeekTo(t){
+  if(!state.loaded) return;
+  els.video.pause();
+  seekToTime(t).then(function(){ els.seek.value=curFrame(); updateFrameUI(); });
+  try{ els.video.scrollIntoView({behavior:'smooth', block:'center'}); }catch(e){}
+}
+// フォーム解析の実行: CDNからライブラリ動的読み込み → Landmarker生成(GPU→WASM) → 区間をシークしながらフレームごとに推論
+// → KYU.poseComputeTempo でイベント検出 → カード内へ表示。失敗時はカード内エラー表示のみ（アプリ本体は落とさない）
+function runPoseAnalysis(){
+  if(poseRunning) return Promise.resolve(null);
+  if(!state.loaded){ toast('先に動画を読み込んでください'); return Promise.resolve(null); }
+  if(state.releaseTime==null){ toast('先にリリース点を設定してください（フォーム解析はリリースマーク中心の区間を処理します）'); return Promise.resolve(null); }
+  var v=els.video;
+  if(!(v.duration>0)){ toast('動画の読み込みが完了してから実行してください'); return Promise.resolve(null); }
+  poseRunning=true;
+  if(poseEls){
+    poseEls.start.disabled=true;
+    poseEls.err.textContent='';
+    poseEls.result.innerHTML='';
+    poseEls.bar.hidden=false; poseEls.bar.value=0;
+    poseEls.progress.hidden=false;
+  }
+  els.video.pause();
+  var savedPos=v.currentTime;
+  var hand=state.poseHand;
+  var preSec=Math.max(0.5, Math.min(10, Number(poseEls.pre.value)||POSE_PRE_SEC));
+  var postSec=Math.max(0.5, Math.min(10, Number(poseEls.post.value)||POSE_POST_SEC));
+  var center=state.releaseTime;
+  var fpsEff=KYU.fpsFromFrameTimes(state.frameTimes)||state.fps;
+  var t0=Math.max(0, center-preSec), t1=Math.min(v.duration, center+postSec);
+  var lm=null; // 実行中の Landmarker
+  setPoseProgress(2, 'モデル読み込み中…（CDNから tasks-vision を動的読み込み）');
+  return poseLoadLib().then(function(lib){
+    var FilesetResolver=lib.pkg.FilesetResolver, PoseLandmarker=lib.pkg.PoseLandmarker;
+    if(!FilesetResolver || !PoseLandmarker) throw new Error('tasks-vision の読み込みに失敗しました（FilesetResolver/PoseLandmarker がありません）');
+    setPoseProgress(4, 'WASMランタイム読み込み中…（@mediapipe/tasks-vision@'+lib.ver+'）');
+    return FilesetResolver.forVisionTasks(lib.wasmBase).then(function(vision){
+      function create(del){
+        return PoseLandmarker.createFromOptions(vision, {
+          baseOptions:{ modelAssetPath:POSE_MODEL_URL, delegate:del },
+          runningMode:'VIDEO',
+          numPoses:1
+        });
+      }
+      return create('GPU').catch(function(){ return create('WASM'); }); // GPUデリゲート失敗時はWASM(CPU)へ
+    });
+  }).then(function(l){
+    lm=l;
+    setPoseProgress(8, '姿勢推定中… '+t0.toFixed(2)+'s 〜 '+t1.toFixed(2)+'s（実効 '+fpsEff.toFixed(1)+'fps）');
+    var step=1/fpsEff;
+    var n=Math.max(1, Math.floor((t1-t0)/step));
+    var frames=[];
+    var i=0;
+    function loop(){
+      if(i>n){
+        setPoseProgress(100, '処理完了: '+(n+1)+' フレーム（ランドマーク取得 '+frames.filter(function(f){ return f.landmarks; }).length+'）');
+        return Promise.resolve(frames);
+      }
+      var t=Math.min(t0+i*step, t1);
+      return seekVideo(v, t).then(function(){
+        var lmk=null;
+        try{
+          var r=lm.detectForVideo(v, Math.round(t*1000)); // タイムスタンプは ms で単調増加が必要
+          if(r && r.landmarks && r.landmarks[0]) lmk=posePickLandmarks(r.landmarks[0]);
+        }catch(e){ lmk=null; } // 推論失敗フレームはスキップ
+        frames.push({t:t, landmarks:lmk});
+        if(i % Math.max(1, Math.floor(n/20)) === 0){
+          setPoseProgress(8+Math.round(90*i/n), '姿勢推定中… '+i+'/'+(n+1)+' フレーム（'+Math.round(100*i/n)+'%）');
+          return new Promise(function(r2){ setTimeout(r2, 0); }).then(loop); // ときどきUIへ制御を戻す
+        }
+        i++;
+        return loop();
+      });
+    }
+    return loop();
+  }).then(function(frames){
+    try{ if(lm && lm.close) lm.close(); }catch(e){}
+    lm=null; poseLandmarker=null;
+    // イベント検出（KYUへ移植したPoCロジック。direction=+1固定）
+    var res=KYU.poseComputeTempo(frames, {hand:hand, direction:1});
+    res.frames=frames;
+    res.frameCount=frames.length;
+    res.validCount=frames.filter(function(f){ return f.landmarks; }).length;
+    res.hand=hand; res.centerReleaseTime=center; res.preSec=preSec; res.postSec=postSec; res.fps=fpsEff;
+    state.poseResult=res;
+    poseRenderResult(res);
+    return res;
+  }).catch(function(e){
+    try{ if(lm && lm.close) lm.close(); }catch(e2){}
+    lm=null; poseLandmarker=null;
+    // CDN読み込み失敗など: カード内にエラーを表示するだけでアプリ本体は落とさない
+    if(poseEls){
+      poseEls.err.textContent='フォーム解析に失敗しました: '+(e && e.message ? e.message : String(e))+
+        '\nCDN（jsdelivr / storage.googleapis.com）にアクセスできない環境では利用できません（work/POSE_POC.md 参照）。アプリ本体の動作には影響しません。';
+      poseEls.progress.textContent='解析失敗';
+      poseEls.bar.value=100;
+    }
+    return null;
+  }).then(function(r){
+    poseRunning=false;
+    updatePoseUI();
+    // 走査で動かした再生位置を元に戻す（単一計測フローの邪魔をしない）
+    try{ v.currentTime=Math.max(0, Math.min(savedPos, v.duration||savedPos)); }catch(e){}
+    try{ els.seek.value=curFrame(); updateFrameUI(); }catch(e){}
+    return r;
+  });
+}
+
 /* ---- 初期化 ---- */
 (function init(){
   var qs=loadQuickSettings();
@@ -4136,6 +4852,7 @@ function runTrajectoryExtraction(){
   else if(typeof qs.height==='string' && qs.height!=='') state.heightCm=qs.height;
   if(typeof qs.camDist==='number' && isFinite(qs.camDist) && qs.camDist>=0) state.camDistM=qs.camDist;
   if(typeof qs.voice==='boolean') state.voiceOn=qs.voice; // 音声読み上げON/OFF（既定ON）
+  if(typeof qs.poseHand==='string' && (qs.poseHand==='left' || qs.poseHand==='right')) state.poseHand=qs.poseHand; // Phase 2: 利き腕（既定 右投げ）
   syncDistUI();
   setControlsEnabled(false);
   updateFrameUI(); updateMarks(); updateResult();
@@ -4143,6 +4860,7 @@ function runTrajectoryExtraction(){
   buildBatchUI(); // 一括解析カードを「1. 動画を読み込む」の直後へJSで挿入
   buildCalibUI(); // タップ校正カードを「2. コマ送り」カードの直後へJSで挿入
   buildTrajUI();  // 軌道抽出カードをタップ校正カードの直後へJSで挿入（Phase 3-B）
+  buildPoseUI();  // フォーム解析（実験）カードを軌道抽出カードの直後へJSで挿入（Phase 2）
   buildVoiceToggles(); // 音声読み上げトグルをクイック/詳細の設定へJSで挿入
   setView('quick'); // 初期画面はクイック計測。カメラを自動起動
 })();
@@ -4173,7 +4891,11 @@ if(typeof module!=='undefined' && module.exports){
     blobCentroid:blobCentroid, buildTrajSamples:buildTrajSamples, extractBallPath:extractBallPath,
     extractBallPathStagedVideo:extractBallPathStagedVideo,
     buildTrajUI:buildTrajUI, updateTrajUI:updateTrajUI, runTrajectoryExtraction:runTrajectoryExtraction,
-    trajEls:function(){ return trajEls; }
+    trajEls:function(){ return trajEls; },
+    buildPoseUI:buildPoseUI, updatePoseUI:updatePoseUI, runPoseAnalysis:runPoseAnalysis,
+    poseRenderResult:poseRenderResult, posePickLandmarks:posePickLandmarks, poseSeekTo:poseSeekTo,
+    poseLoadLib:poseLoadLib, POSE_IDX:POSE_IDX, POSE_MODEL_URL:POSE_MODEL_URL,
+    poseEls:function(){ return poseEls; }, poseRunning:function(){ return poseRunning; }
   };
 }
 })();
