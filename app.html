@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.12 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.13 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -2767,7 +2767,7 @@ var els={
   listDate:$('listDate'), stats:$('stats'), recordList:$('recordList'), toast:$('toast')
 };
 
-var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null, voiceOn:true, calib:{active:false, points:[], source:null, advanceM:null, pxPerM:null}, lastIvb:null, poseHand:'right', poseResult:null };
+var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null, voiceOn:true, calib:{active:false, points:[], source:null, advanceM:null, pxPerM:null}, lastIvb:null, poseHand:'right', poseResult:null, shootMode:'side' };
 var q={ stream:null, starting:false, monitor:null, prev:null, gate:KYU.newGate(),
       mode:'off', mediaRec:null, chunks:[], mime:'', recStartAt:0, blob:null, recId:null, arrivalSource:'', analyzeUrl:null };
 var objectUrl=null;
@@ -2799,7 +2799,7 @@ function loadAll(){ try{ var d=JSON.parse(localStorage.getItem(LS_KEY)); return 
 function saveAll(d){ try{ localStorage.setItem(LS_KEY, JSON.stringify(d)); }catch(e){ toast('保存に失敗しました（容量不足の可能性があります）'); } }
 function loadQuickSettings(){ try{ var d=JSON.parse(localStorage.getItem(QLS_KEY)); return (d&&typeof d==='object')?d:{}; }catch(e){ return {}; } }
 function saveQuickSettings(){
-  try{ localStorage.setItem(QLS_KEY, JSON.stringify({dist:state.distPreset, custom:state.customDist, corr:state.correction, name:els.qPlayerName.value, height:state.heightCm, camDist:state.camDistM, voice:state.voiceOn, poseHand:state.poseHand})); }catch(e){}
+  try{ localStorage.setItem(QLS_KEY, JSON.stringify({dist:state.distPreset, custom:state.customDist, corr:state.correction, name:els.qPlayerName.value, height:state.heightCm, camDist:state.camDistM, voice:state.voiceOn, poseHand:state.poseHand, shootMode:state.shootMode})); }catch(e){}
 }
 
 function toast(msg){
@@ -3211,10 +3211,13 @@ function resultPanelHTML(r, excludeId){
   var st=dayStats(excludeId, heroKmh);
   var ms=Math.round(r.timeSec*1000);
   // Phase 3-B: 縦変化量タイルは軌道抽出を実行してゲート合格した記録のみ値を出す（それ以外は「—」）
+  // §13 v0.13: rear（後方撮影）では縦変化量は側面撮影専用のため「—」＋注記にする
   var ivb=state.lastIvb;
-  var ivbOk=(ivb && ivb.pass && typeof ivb.ivbCm==='number' && isFinite(ivb.ivbCm));
+  var rear=isRear();
+  var ivbOk=(!rear) && (ivb && ivb.pass && typeof ivb.ivbCm==='number' && isFinite(ivb.ivbCm));
   var ivbVal=ivbOk ? '+'+ivb.ivbCm.toFixed(1)+' cm' : '—';
-  var ivbSub=ivbOk ? '軌道抽出 '+ivb.nUsed+'/'+ivb.nTotal+'点・ゲート合格'+(ivb.mode && ivb.mode!=='fine' ? '・低解像度抽出（フォールバック）' : '')
+  var ivbSub= rear ? '後方撮影モード（縦変化量は側面撮影専用のため非表示）'
+            : ivbOk ? '軌道抽出 '+ivb.nUsed+'/'+ivb.nTotal+'点・ゲート合格'+(ivb.mode && ivb.mode!=='fine' ? '・低解像度抽出（フォールバック）' : '')
             : (ivb && ivb.reasons && ivb.reasons.length) ? 'ゲート不合格: '+ivb.reasons.join('、')+(ivb.mode && ivb.mode!=='fine' ? '・低解像度抽出（フォールバック）' : '')
             : '軌道抽出未実行（実験）';
   // 終速（推定）タイルと減衰率タイル（初速×e^(−kD) とその減衰率%）
@@ -4024,19 +4027,23 @@ function makeRecord(r, o){
   if(o.videoTime!=null) rec.videoTime=o.videoTime; // 一括解析: 動画内時刻(秒)
   // Phase 3-B: 終速 plateKmh を保存。ivbCm は軌道抽出がゲート合格した記録のみ保存する
   if(typeof r.plateKmh==='number' && isFinite(r.plateKmh)) rec.plateKmh=r.plateKmh;
-  // Phase 2: フォーム解析（実験）でテンポが計算できた場合は tempoSec として記録へ含める
-  // （現リリースマークに対して解析した結果に限定。マーク変更後の古い結果は記録に混ぜない）
-  if(state.poseResult && typeof state.poseResult.tempoSec==='number' && isFinite(state.poseResult.tempoSec) &&
-     state.poseResult.centerReleaseTime===state.releaseTime){
-    rec.tempoSec=state.poseResult.tempoSec;
-  }
-  if(typeof o.ivbCm==='number' && isFinite(o.ivbCm)){
-    rec.ivbCm=o.ivbCm;
-  }else if(state.lastIvb && state.lastIvb.pass && typeof state.lastIvb.ivbCm==='number' &&
-           state.lastIvb.window && state.releaseTime!=null && state.arrivalTime!=null &&
-           Math.abs(state.lastIvb.window.start-state.releaseTime)<1e-9 &&
-           Math.abs(state.lastIvb.window.end-state.arrivalTime)<1e-9){
-    rec.ivbCm=state.lastIvb.ivbCm; // 現マークに対応する合格済み抽出結果があれば記録へ
+  // Phase 2/3-B: tempoSec / ivbCm は側面撮影モード（side）のときだけ記録へ含める
+  // （§13 v0.13: rear では軌道抽出・フォーム解析が無効なため、記録へ ivbCm / tempoSec が混入しないことを保証する）
+  if(!isRear()){
+    // Phase 2: フォーム解析（実験）でテンポが計算できた場合は tempoSec として記録へ含める
+    // （現リリースマークに対して解析した結果に限定。マーク変更後の古い結果は記録に混ぜない）
+    if(state.poseResult && typeof state.poseResult.tempoSec==='number' && isFinite(state.poseResult.tempoSec) &&
+       state.poseResult.centerReleaseTime===state.releaseTime){
+      rec.tempoSec=state.poseResult.tempoSec;
+    }
+    if(typeof o.ivbCm==='number' && isFinite(o.ivbCm)){
+      rec.ivbCm=o.ivbCm;
+    }else if(state.lastIvb && state.lastIvb.pass && typeof state.lastIvb.ivbCm==='number' &&
+             state.lastIvb.window && state.releaseTime!=null && state.arrivalTime!=null &&
+             Math.abs(state.lastIvb.window.start-state.releaseTime)<1e-9 &&
+             Math.abs(state.lastIvb.window.end-state.arrivalTime)<1e-9){
+      rec.ivbCm=state.lastIvb.ivbCm; // 現マークに対応する合格済み抽出結果があれば記録へ
+    }
   }
   return rec;
 }
@@ -4217,6 +4224,71 @@ function buildVoiceToggles(){
   voiceToggles.push(makeVoiceToggle(els.camDistInput));
 }
 
+/* ---- 撮影モード（側面／後方）: DESIGN.md §13 仕様改訂 v0.4 の 13.2 項目1（v0.13） ----
+   side（既定）= 現行どおりの全機能（練習・ブルペンの側面撮影。挙動は完全に現行同一）。
+   rear = 試合中の後方（捕手の後ろ）からの撮影。球速計測（手動マーク／クイック計測／一括解析）・初速換算・
+   音速遅延補正はそのまま使える（既存の距離プリセット・リリース補正・カメラ〜ミット距離入力がそのまま効く）。
+   ただし軌道抽出（IVB）・タップ校正・フォーム解析（テンポ）は側面幾何学の前提で作られているため、rear では
+   実行ボタンを無効化してカード内に理由を明示し、実行関数にもガードを入れる。記録への ivbCm / tempoSec 混入は
+   makeRecord 側で遮断する。
+   モードは設定として kyusoku.quick.v1 に永続化（初期値 side）。UIはHTML無変更でJS生成（既存のJS生成カードと
+   同じ流儀。切替は既存 .seg セグメントボタンの流儀に合わせる）。 */
+var SHOOT_MODE_SIDE='side', SHOOT_MODE_REAR='rear';
+var REAR_GUIDE_POINTS=[
+  'ネットにできるだけ近づけるか、ネットより高い位置から撮る',
+  '2〜3倍ズーム推奨',
+  '投手が画面中央に入るよう固定する（三脚など）'
+];
+var shootSegs=[]; // {view, seg, btns:[sideBtn, rearBtn], guide}
+function isRear(){ return state.shootMode===SHOOT_MODE_REAR; }
+// 撮影モードの設定。両画面のセグメントボタンを同期し、後方撮影ガイドの表示とモード依存カード
+// （軌道抽出/タップ校正/フォーム解析）の有効/無効・理由表示を更新してから永続化する
+function setShootMode(m){
+  if(m!==SHOOT_MODE_SIDE && m!==SHOOT_MODE_REAR) return;
+  state.shootMode=m;
+  if(m===SHOOT_MODE_REAR && state.calib && state.calib.active && typeof cancelCalibration==='function') cancelCalibration(); // 校正途中に後方へ切替えたら中断
+  saveQuickSettings();
+  updateShootModeUI();
+}
+function updateShootModeUI(){
+  var rear=isRear();
+  shootSegs.forEach(function(s){
+    s.btns.forEach(function(b){ b.classList.toggle('active', b.dataset.mode===state.shootMode); });
+    if(s.guide) s.guide.hidden=!rear;
+  });
+  updateTrajUI(); updateCalibUI(); updatePoseUI(); // モード依存カードのボタン/理由表示を更新
+  updateResult();
+}
+// クイック/詳細の各画面へ「撮影モード」セグメント＋rear時だけ表示する後方撮影ガイドをJSで挿入（HTML無変更）
+function buildShootModeUI(){
+  if(shootSegs.length) return;
+  shootSegs.push(makeShootModeBlock('quick', els.qCamInfo, els.quickView, false));  // クイック: カメラ情報の直後（距離プリセットの手前）
+  shootSegs.push(makeShootModeBlock('detail', els.modeSeg, els.detailView, true));  // 詳細: 「1. 動画を読み込む」カードの先頭（modeSegの直前）
+  updateShootModeUI();
+}
+function makeShootModeBlock(view, anchor, fallbackParent, insertBeforeAnchor){
+  var wrap=document.createElement('div');
+  var label=document.createElement('div');
+  label.className='row-label';
+  label.textContent='撮影モード（前回値を自動で復元）';
+  var seg=document.createElement('div');
+  seg.className='seg'; seg.id=(view==='quick' ? 'qShootSeg' : 'dShootSeg');
+  var bSide=document.createElement('button'); bSide.type='button'; bSide.dataset.mode=SHOOT_MODE_SIDE; bSide.textContent='側面（練習）';
+  var bRear=document.createElement('button'); bRear.type='button'; bRear.dataset.mode=SHOOT_MODE_REAR; bRear.textContent='後方（試合）';
+  bSide.addEventListener('click', function(){ setShootMode(SHOOT_MODE_SIDE); });
+  bRear.addEventListener('click', function(){ setShootMode(SHOOT_MODE_REAR); });
+  seg.appendChild(bSide); seg.appendChild(bRear);
+  var guide=document.createElement('div');
+  guide.className='guide'; guide.id=(view==='quick' ? 'qRearGuide' : 'dRearGuide');
+  guide.innerHTML='<b>後方撮影ガイド（試合中はここから撮る）</b><ul>'+
+    REAR_GUIDE_POINTS.map(function(p){ return '<li>'+p+'</li>'; }).join('')+'</ul>';
+  wrap.appendChild(label); wrap.appendChild(seg); wrap.appendChild(guide);
+  var parent=(anchor && anchor.parentNode) ? anchor.parentNode : fallbackParent;
+  if(insertBeforeAnchor) parent.insertBefore(wrap, anchor);
+  else parent.insertBefore(wrap, anchor ? anchor.nextSibling : null);
+  return {view:view, seg:seg, btns:[bSide,bRear], guide:guide};
+}
+
 /* ---- 2点タップ校正（詳細モード・JS生成UI。HTMLは無変更） ----
   ねらい: リリース補正（前進距離）を身長×0.7の仮定ではなく映像からの実測値にする。
    手順: ①投球プレート ②ホームベース（①②の実世界距離=現在の距離プリセット）③リリース位置（現在の再生フレームに対してタップ）。
@@ -4275,12 +4347,13 @@ function buildCalibUI(){
       '<div></div>'+
     '</div>'+
     '<p id="calibStatus" class="muted small" style="margin-top:6px"></p>'+
-    '<p id="calibResult" class="small" style="margin-top:2px;font-weight:700"></p>';
+    '<p id="calibResult" class="small" style="margin-top:2px;font-weight:700"></p>'+
+    '<p class="small" id="calibRearNote" hidden style="color:var(--gold);font-weight:700;margin-top:6px"></p>';
   var anchor=els.video.closest('.card'); // 「2. コマ送り」カードの直後に挿入
   (anchor && anchor.parentNode ? anchor.parentNode : els.detailView).insertBefore(card, anchor ? anchor.nextSibling : null);
   calibEls={
     card:card, start:$('calibStartBtn'), cancel:$('calibCancelBtn'), redo:$('calibRedoBtn'),
-    status:$('calibStatus'), result:$('calibResult')
+    status:$('calibStatus'), result:$('calibResult'), note:$('calibRearNote')
   };
   calibEls.start.addEventListener('click', function(){ startCalibration(); });
   calibEls.redo.addEventListener('click', function(){ redoCalibration(); });
@@ -4289,6 +4362,7 @@ function buildCalibUI(){
   updateCalibUI();
 }
 function startCalibration(){
+  if(isRear()){ toast('タップ校正は側面撮影専用です。後方撮影では球速のみ計測できます'); return; } // §13 v0.13: rearでは無効
   if(!state.loaded){ toast('先に動画を読み込んでください'); return; }
   if(!(els.video.videoWidth>0)){ toast('動画の読み込みが完了してから開始してください'); return; }
   els.video.pause();
@@ -4343,7 +4417,12 @@ function updateCalibUI(){
   if(!calibEls) return;
   var c=state.calib||{active:false, points:[], source:null};
   var n=c.points ? c.points.length : 0;
-  calibEls.start.disabled=!state.loaded;
+  var rear=isRear(); // §13 v0.13: rearではタップ校正（側面幾何学）を無効化し理由を明示
+  if(calibEls.note){
+    calibEls.note.hidden=!rear;
+    if(rear) calibEls.note.textContent='タップ校正は側面撮影専用です（プレート〜ホームの2点タップで縮尺を取ります）。後方撮影では球速のみ計測できます';
+  }
+  calibEls.start.disabled=!state.loaded || rear;
   if(c.active){
     calibEls.status.textContent = n<3
       ? '校正モード中: ('+(n+1)+'/3) '+CALIB_STEPS[n]+' を動画上でタップしてください（現在の再生フレームに対して打ちます）'
@@ -4535,20 +4614,27 @@ function buildTrajUI(){
     '<div class="mark-row" style="margin-top:8px">'+
       '<button class="btn btn-primary" id="trajStartBtn" disabled>軌道抽出を実行</button>'+
     '</div>'+
-    '<p id="trajStatus" class="muted small" style="margin-top:6px"></p>';
+    '<p id="trajStatus" class="muted small" style="margin-top:6px"></p>'+
+    '<p class="small" id="trajRearNote" hidden style="color:var(--gold);font-weight:700;margin-top:6px"></p>';
   var anchor=(calibEls && calibEls.card) || els.video.closest('.card'); // タップ校正カードの直後に挿入
   (anchor && anchor.parentNode ? anchor.parentNode : els.detailView).insertBefore(card, anchor ? anchor.nextSibling : null);
-  trajEls={card:card, start:$('trajStartBtn'), status:$('trajStatus')};
+  trajEls={card:card, start:$('trajStartBtn'), status:$('trajStatus'), note:$('trajRearNote')};
   trajEls.start.addEventListener('click', function(){ runTrajectoryExtraction(); });
   updateTrajUI();
 }
 function updateTrajUI(){
   if(!trajEls) return;
-  trajEls.start.disabled = !(state.loaded && state.releaseTime!=null && state.arrivalTime!=null);
+  var rear=isRear(); // §13 v0.13: rearでは軌道抽出（縦変化量・側面幾何学）を無効化し理由を明示
+  if(trajEls.note){
+    trajEls.note.hidden=!rear;
+    if(rear) trajEls.note.textContent='縦変化量（IVB）は側面撮影専用です。後方撮影では球速のみ計測できます';
+  }
+  trajEls.start.disabled = rear || !(state.loaded && state.releaseTime!=null && state.arrivalTime!=null);
 }
 function trajStatus(msg){ if(trajEls) trajEls.status.textContent=msg; }
 // 軌道抽出の実行: 抽出 → ivbFromFit → flightQualityGate → 合格時のみ state.lastIvb に結果を保持して結果パネルへ
 function runTrajectoryExtraction(){
+  if(isRear()){ toast('縦変化量（IVB）は側面撮影専用です。後方撮影では球速のみ計測できます'); return Promise.resolve(null); } // §13 v0.13: rearでは無効
   if(!state.loaded){ toast('先に動画を読み込んでください'); return Promise.resolve(null); }
   if(state.releaseTime==null || state.arrivalTime==null){ toast('先にリリース点と到達点を設定してください'); return Promise.resolve(null); }
   var v=els.video;
@@ -4685,12 +4771,14 @@ function buildPoseUI(){
     '<progress id="poseBar" max="100" value="0" style="width:100%;margin-top:8px" hidden></progress>'+
     '<div id="poseProgress" class="muted small" style="margin-top:4px" hidden></div>'+
     '<p id="poseErr" class="err" style="margin-top:6px;white-space:pre-wrap"></p>'+
-    '<div id="poseResult" class="small" style="margin-top:6px"></div>';
+    '<div id="poseResult" class="small" style="margin-top:6px"></div>'+
+    '<p class="small" id="poseRearNote" hidden style="color:var(--gold);font-weight:700;margin-top:6px"></p>';
   var anchor=(trajEls && trajEls.card) || els.video.closest('.card'); // 軌道抽出カードの直後に挿入
   (anchor && anchor.parentNode ? anchor.parentNode : els.detailView).insertBefore(card, anchor ? anchor.nextSibling : null);
   poseEls={
     card:card, hand:$('poseHandSel'), pre:$('posePreSec'), post:$('posePostSec'),
-    start:$('poseStartBtn'), bar:$('poseBar'), progress:$('poseProgress'), err:$('poseErr'), result:$('poseResult')
+    start:$('poseStartBtn'), bar:$('poseBar'), progress:$('poseProgress'), err:$('poseErr'), result:$('poseResult'),
+    note:$('poseRearNote')
   };
   poseEls.hand.value=state.poseHand;
   poseEls.hand.addEventListener('change', function(){ // 利き腕は設定として保存する
@@ -4702,7 +4790,12 @@ function buildPoseUI(){
 }
 function updatePoseUI(){
   if(!poseEls) return;
-  poseEls.start.disabled = !(state.loaded && state.releaseTime!=null && !poseRunning);
+  var rear=isRear(); // §13 v0.13: rearではフォーム解析（テンポ・側面幾何学）を無効化し理由を明示
+  if(poseEls.note){
+    poseEls.note.hidden=!rear;
+    if(rear) poseEls.note.textContent='フォーム解析（テンポ）は側面撮影専用です。後方撮影では球速のみ計測できます';
+  }
+  poseEls.start.disabled = rear || !(state.loaded && state.releaseTime!=null && !poseRunning);
 }
 function setPoseProgress(pct, msg){
   if(!poseEls) return;
@@ -4742,6 +4835,7 @@ function poseSeekTo(t){
 // → KYU.poseComputeTempo でイベント検出 → カード内へ表示。失敗時はカード内エラー表示のみ（アプリ本体は落とさない）
 function runPoseAnalysis(){
   if(poseRunning) return Promise.resolve(null);
+  if(isRear()){ toast('フォーム解析（テンポ）は側面撮影専用です。後方撮影では球速のみ計測できます'); return Promise.resolve(null); } // §13 v0.13: rearでは無効
   if(!state.loaded){ toast('先に動画を読み込んでください'); return Promise.resolve(null); }
   if(state.releaseTime==null){ toast('先にリリース点を設定してください（フォーム解析はリリースマーク中心の区間を処理します）'); return Promise.resolve(null); }
   var v=els.video;
@@ -4853,6 +4947,7 @@ function runPoseAnalysis(){
   if(typeof qs.camDist==='number' && isFinite(qs.camDist) && qs.camDist>=0) state.camDistM=qs.camDist;
   if(typeof qs.voice==='boolean') state.voiceOn=qs.voice; // 音声読み上げON/OFF（既定ON）
   if(typeof qs.poseHand==='string' && (qs.poseHand==='left' || qs.poseHand==='right')) state.poseHand=qs.poseHand; // Phase 2: 利き腕（既定 右投げ）
+  if(qs.shootMode==='rear') state.shootMode='rear'; // §13 v0.13: 撮影モード（既定 side＝現行どおり）
   syncDistUI();
   setControlsEnabled(false);
   updateFrameUI(); updateMarks(); updateResult();
@@ -4862,6 +4957,7 @@ function runPoseAnalysis(){
   buildTrajUI();  // 軌道抽出カードをタップ校正カードの直後へJSで挿入（Phase 3-B）
   buildPoseUI();  // フォーム解析（実験）カードを軌道抽出カードの直後へJSで挿入（Phase 2）
   buildVoiceToggles(); // 音声読み上げトグルをクイック/詳細の設定へJSで挿入
+  buildShootModeUI(); // 撮影モード切替＋後方撮影ガイドをクイック/詳細へJSで挿入（§13 v0.13）
   setView('quick'); // 初期画面はクイック計測。カメラを自動起動
 })();
 /* Node単体テスト用フック（ブラウザでは module 未定義のため無効。module.exports は KYU のまま変えない） */
@@ -4895,7 +4991,10 @@ if(typeof module!=='undefined' && module.exports){
     buildPoseUI:buildPoseUI, updatePoseUI:updatePoseUI, runPoseAnalysis:runPoseAnalysis,
     poseRenderResult:poseRenderResult, posePickLandmarks:posePickLandmarks, poseSeekTo:poseSeekTo,
     poseLoadLib:poseLoadLib, POSE_IDX:POSE_IDX, POSE_MODEL_URL:POSE_MODEL_URL,
-    poseEls:function(){ return poseEls; }, poseRunning:function(){ return poseRunning; }
+    poseEls:function(){ return poseEls; }, poseRunning:function(){ return poseRunning; },
+    setShootMode:setShootMode, isRear:isRear, buildShootModeUI:buildShootModeUI, updateShootModeUI:updateShootModeUI,
+    shootSegs:function(){ return shootSegs; },
+    buildRec:buildRec, autoSaveQuick:autoSaveQuick, q:q
   };
 }
 })();
