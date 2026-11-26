@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.14 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.15 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -2827,6 +2827,115 @@ var KYU=(function(){
     return out;
   }
 
+  /* ---- v0.15 プレート通過位置（後方モード専用）: 純粋関数群 ----
+     前提: 後方校正（ホームベース前端の左右2タップ）でプレート面の px/m（rearPxPerMeter）が確定していること。
+     通過時刻の推定: 捕球点はプレート前端の後方約 mittBehindM m にあるため
+       platePassTime = 到達時刻 − mittBehindM ÷ (プレート通過速度[m/s])。通過速度は既存の plateKmh（終速推定, km/h）を使う。
+     位置の算出: 通過フレームでプレート周辺ROIを基準フレーム差分してボール重心を取り（centroidInRoi）、
+       タップしたプレート前端の左端・右端とそのy座標を基準に
+       左右 xCm = (ball.x − プレート中心x) ÷ pxPerM × 100（画像右が＋）、
+       高さ hCm = (プレート面y − ball.y) ÷ pxPerM × 100（上向きが＋。画像yは下向き正）
+       px/m は rearPxPerMeter を縦横同一とみなす一次近似（UIと記録に明記）。 */
+  var MITT_BEHIND_M_DEFAULT=0.8; // 捕球点のプレート前端からの後方距離の既定値（m。変更可能）
+  var ZONE_LOW_CM=45;            // ストライクゾーン目安の下限高さ既定値（cm）
+  var ZONE_HIGH_CM=110;          // ストライクゾーン目安の上限高さ既定値（cm）
+  var PLATE_ROI_W_MULT=1.5;      // プレートROIの左右幅 = プレート幅 × 各1.5倍（誤検出抑制）
+  var PLATE_ROI_H_M=1.6;         // プレートROIの高さ上限 = プレート面から約1.6m相当（px/m換算・上向き）
+  var PLATE_ROI_DOWN_M=0.2;      // プレートROIの下側マージン = プレート面から約0.2m相当（下向き）
+  var PLATE_MIN_PX=4;            // プレート通過検出で採用する最小ブロブピクセル数（FINE_MIN_PX と同水準）
+
+  // プレート通過時刻（純粋関数）: arrivalSec=到達（捕球）時刻, mittBehindM=捕球点のプレート前端からの後方距離[m],
+  // plateKmh=プレート通過速度（既存の終速推定 plateKmh, km/h）。
+  // 戻り値: arrivalSec − mittBehindM/(plateKmh/3.6) [秒]。無効入力（非数・速度0以下・負の距離）は null
+  function platePassTime(arrivalSec, mittBehindM, plateKmh){
+    var a=Number(arrivalSec), m=Number(mittBehindM), k=Number(plateKmh);
+    if(!isFinite(a) || !isFinite(m) || m<0) return null;
+    if(!isFinite(k) || k<=0) return null;
+    var v=k/3.6; // km/h → m/s
+    if(!(v>0)) return null;
+    return a - m/v;
+  }
+
+  // プレート通過位置（純粋関数）: ball={x,y} は通過フレームで検出したボール重心（実映像px）、
+  // plateLeft/plateRight は後方校正でタップしたプレート前端の左端・右端 {x,y}（実映像px）。
+  // px/m は2点間距離÷実幅43.2cm から自前で算出する（rearPlatePxPerMeter 流用。縦横同一スケールの一次近似）。
+  // 戻り値: {xCm, hCm, pxPerM, centerX, plateY}（xCm=画像右が＋のcm, hCm=上向きが＋のcm）。
+  //   ball/2点が不正・2点がほぼ同一なら null
+  function platePositionFromPx(ball, plateLeft, plateRight){
+    if(!ball || !isFinite(Number(ball.x)) || !isFinite(Number(ball.y))) return null;
+    var ppm=rearPlatePxPerMeter(plateLeft, plateRight); // 実幅43.2cm換算（縦横同一とみなす一次近似）
+    if(ppm==null || !(ppm>0)) return null;
+    var cx=(Number(plateLeft.x)+Number(plateRight.x))/2;
+    var py=(Number(plateLeft.y)+Number(plateRight.y))/2; // プレート面（前端）のy座標
+    var xCm=(Number(ball.x)-cx)/ppm*100; // 画像右が＋
+    var hCm=(py-Number(ball.y))/ppm*100; // 上向きが＋（画像yは下向き正）
+    return {xCm:xCm, hCm:hCm, pxPerM:ppm, centerX:cx, plateY:py};
+  }
+
+  // 矩形ROI内の基準フレーム差分重心（純粋関数。二段抽出の精段 centroidAround の矩形版）
+  // baseGray/curGray: 同サイズのグレースケール配列（width×height）。roi={x0,y0,x1,y1} はピクセル座標（両端含む・画像外は切り詰め）
+  // 戻り値: {x,y,w,n}（フルフレーム座標でのサブピクセル重心。x,y は画素中心座標）／対象なし・不正なら null
+  function centroidInRoi(baseGray, curGray, width, height, roi, threshold){
+    width=Math.floor(Number(width)); height=Math.floor(Number(height));
+    if(!baseGray || !curGray || !(width>0) || !(height>0) ||
+       baseGray.length<width*height || curGray.length<width*height || !roi) return null;
+    var x0=Math.max(0, Math.floor(Number(roi.x0)));
+    var y0=Math.max(0, Math.floor(Number(roi.y0)));
+    var x1=Math.min(width-1, Math.ceil(Number(roi.x1)));
+    var y1=Math.min(height-1, Math.ceil(Number(roi.y1)));
+    if(!(isFinite(x0)&&isFinite(y0)&&isFinite(x1)&&isFinite(y1))) return null;
+    if(x1<x0 || y1<y0) return null;
+    var cw=x1-x0+1, ch=y1-y0+1;
+    var diff=new Float32Array(cw*ch), x, y;
+    for(y=0;y<ch;y++){
+      var rs=(y0+y)*width+x0, rd=y*cw;
+      for(x=0;x<cw;x++){ diff[rd+x]=curGray[rs+x]-baseGray[rs+x]; }
+    }
+    var c=centroidFromDiff(diff, cw, ch, threshold);
+    if(!c) return null;
+    return {x:c.x+x0, y:c.y+y0, w:c.w, n:c.n};
+  }
+
+  // プレート周辺ROI（純粋関数）: タップしたプレート前端の左右2点と px/m から、誤検出抑制のため
+  //   左右 = プレート幅の各1.5倍（計3倍幅）、高さ = プレート面から上約1.6m相当＋下約0.2m相当 までに限定した
+  //   矩形ROIを実映像pxで返す。vw/vh は動画の実解像度（ROIは画像内に切り詰める）
+  // 戻り値: {x0,y0,x1,y1（両端含む）, cx, py, pw} ／不正なら null
+  function plateRoiPx(plateLeft, plateRight, pxPerM, vw, vh){
+    var ppm=Number(pxPerM);
+    if(!isFinite(ppm) || !(ppm>0)) return null;
+    if(!plateLeft || !plateRight) return null;
+    var vw2=Math.floor(Number(vw)), vh2=Math.floor(Number(vh));
+    if(!(vw2>0) || !(vh2>0)) return null;
+    var pw=Math.sqrt(Math.pow(Number(plateRight.x)-Number(plateLeft.x),2)+Math.pow(Number(plateRight.y)-Number(plateLeft.y),2));
+    if(!(pw>0)) return null;
+    var cx=(Number(plateLeft.x)+Number(plateRight.x))/2;
+    var py=(Number(plateLeft.y)+Number(plateRight.y))/2;
+    var halfW=PLATE_ROI_W_MULT*pw;   // 左右各1.5倍
+    var up=PLATE_ROI_H_M*ppm;         // 上約1.6m相当
+    var down=PLATE_ROI_DOWN_M*ppm;    // 下約0.2m相当
+    var x0=Math.max(0, Math.floor(cx-halfW));
+    var x1=Math.min(vw2-1, Math.ceil(cx+halfW));
+    var y0=Math.max(0, Math.floor(py-up));
+    var y1=Math.min(vh2-1, Math.ceil(py+down));
+    if(x1<x0 || y1<y0) return null;
+    return {x0:x0, y0:y0, x1:x1, y1:y1, cx:cx, py:py, pw:pw};
+  }
+
+  // ストライクゾーン目安の内/外判定（純粋関数）: xCm/hCm はプレート通過位置（cm）。
+  // opts={lowCm, highCm, widthCm}（省略時は既定: 高さ45〜110cm・幅43.2cm=ホームベース幅）
+  // 戻り値: {inZone, widthOk, heightOk, halfWidthCm, lowCm, highCm}
+  function plateZone(xCm, hCm, opts){
+    opts=opts||{};
+    var x=Number(xCm), h=Number(hCm);
+    var low=(typeof opts.lowCm==='number' && isFinite(opts.lowCm)) ? opts.lowCm : ZONE_LOW_CM;
+    var high=(typeof opts.highCm==='number' && isFinite(opts.highCm)) ? opts.highCm : ZONE_HIGH_CM;
+    var w=(typeof opts.widthCm==='number' && isFinite(opts.widthCm) && opts.widthCm>0) ? opts.widthCm : REAR_PLATE_WIDTH_M*100;
+    var half=w/2;
+    if(!isFinite(x) || !isFinite(h)) return {inZone:false, widthOk:false, heightOk:false, halfWidthCm:half, lowCm:low, highCm:high};
+    var wOk=Math.abs(x)<=half, hOk=(h>=low && h<=high);
+    return {inZone:(wOk&&hOk), widthOk:wOk, heightOk:hOk, halfWidthCm:half, lowCm:low, highCm:high};
+  }
+
   // 到達候補（純粋関数）: 捕球音オンセット候補（秒）の列から、リリース時刻 releaseT 以降で最初に立つものを
   // 音速遅延補正（distM/343を差し引く既存 applySoundDelay）つきで返す。無い/不正なら null
   function firstAudioOnsetAfter(peakSecs, releaseT, distM){
@@ -2872,7 +2981,11 @@ var KYU=(function(){
     REAR_PLATE_WIDTH_M:REAR_PLATE_WIDTH_M, REAR_SEP_WIN_MS:REAR_SEP_WIN_MS, REAR_SEP_HALF:REAR_SEP_HALF,
     REAR_SEP_THR:REAR_SEP_THR, REAR_SEP_MIN_PX:REAR_SEP_MIN_PX, REAR_SEP_DIST:REAR_SEP_DIST, REAR_SEP_WEAK_MIN_PX:REAR_SEP_WEAK_MIN_PX,
     rearPlatePxPerMeter:rearPlatePxPerMeter, detectSeparation:detectSeparation,
-    classifyRelease:classifyRelease, firstAudioOnsetAfter:firstAudioOnsetAfter
+    classifyRelease:classifyRelease, firstAudioOnsetAfter:firstAudioOnsetAfter,
+    MITT_BEHIND_M_DEFAULT:MITT_BEHIND_M_DEFAULT, ZONE_LOW_CM:ZONE_LOW_CM, ZONE_HIGH_CM:ZONE_HIGH_CM,
+    PLATE_ROI_W_MULT:PLATE_ROI_W_MULT, PLATE_ROI_H_M:PLATE_ROI_H_M, PLATE_ROI_DOWN_M:PLATE_ROI_DOWN_M, PLATE_MIN_PX:PLATE_MIN_PX,
+    platePassTime:platePassTime, platePositionFromPx:platePositionFromPx, centroidInRoi:centroidInRoi,
+    plateRoiPx:plateRoiPx, plateZone:plateZone
   };
 })();
 if(typeof module!=='undefined' && module.exports){ module.exports=KYU; }
@@ -2919,7 +3032,7 @@ var els={
 };
 
 var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null, voiceOn:true, calib:{active:false, points:[], source:null, advanceM:null, pxPerM:null}, lastIvb:null, poseHand:'right', poseResult:null, shootMode:'side',
-  rearCalib:{active:false, points:[], pxPerM:null}, rearResult:null }; // §13 v0.4: 後方校正（動画ごとに保持・リセット）と後方球速モードの結果
+  rearCalib:{active:false, points:[], pxPerM:null, mittBehindM:KYU.MITT_BEHIND_M_DEFAULT, zoneLowCm:KYU.ZONE_LOW_CM, zoneHighCm:KYU.ZONE_HIGH_CM}, rearResult:null }; // §13 v0.4: 後方校正（動画ごとに保持・リセット）と後方球速モードの結果。v0.15: 捕球点後方距離・ゾーン高さ設定も動画ごとに保持
 var q={ stream:null, starting:false, monitor:null, prev:null, gate:KYU.newGate(),
       mode:'off', mediaRec:null, chunks:[], mime:'', recStartAt:0, blob:null, recId:null, arrivalSource:'', analyzeUrl:null };
 var objectUrl=null;
@@ -3357,6 +3470,49 @@ function tile(label, val, sub, accent){
     '<div class="t-val'+(accent?' t-acc':'')+'">'+val+'</div>'+
     (sub?'<div class="t-sub">'+sub+'</div>':'')+'</div>';
 }
+// v0.15: プレート通過位置タイル群（rear専用の追加表示。既存12タイルの構成は不変のため ptile クラスで別枠にする）
+//   左右cm（画像右＋）・高さcm（上向き＋）。検出できなければ「—」＋理由。未校正なら校正を促す表示。
+//   px/m は rearPxPerMeter を縦横同一とみなす一次近似であることを明記。ゾーン目安（幅43.2cm・高さは設定の下限〜上限cm）
+//   に対する内/外も添える。rear && state.rearResult が無いときは ''（sideでは一切出さない＝回帰なし）
+function plateTilesHTML(){
+  if(!isRear() || !state.rearResult) return '';
+  var rr=state.rearResult, plate=rr.plate;
+  var sett=rearPlateSettings();
+  var ppm=rearCalibPxPerM();
+  function pt(label, val, sub){
+    return '<div class="ptile"><div class="t-label">'+label+'</div>'+
+      '<div class="t-val">'+val+'</div>'+(sub?'<div class="t-sub">'+sub+'</div>':'')+'</div>';
+  }
+  var xTxt='—', hTxt='—', zTxt='—', note='px/mは縦横同一（rearPxPerMeter）の一次近似';
+  if(!plate){
+    if(ppm==null) note='未校正のため計測不可。「後方校正」でホームベース前端の左右2点をタップしてください（球速は校正なしで計測済み）';
+    else note='未計測（後方球速の自動計測で算出されます）';
+  }else if(!plate.found){
+    if(plate.reason==='uncalibrated'){
+      note='未校正のため計測不可。「後方校正」でホームベース前端の左右2点をタップしてください（球速は校正なしで計測済み）';
+    }else if(plate.reason==='no-marks' || plate.reason==='no-speed'){
+      note='リリース/到達時刻または球速が確定していないため計測していません';
+    }else{
+      note='プレートROIでボールを検出できませんでした（球速のみ記録）'+
+           (plate.passT!=null?' ・ 通過推定 F'+pad(frameNoOf(plate.passT),4)+'（到達 − '+plate.mittBehindM.toFixed(1)+'m ÷ 終速）':'');
+    }
+  }else{
+    xTxt=(plate.xCm>=0?'+':'')+plate.xCm.toFixed(1)+' cm';
+    hTxt=plate.hCm.toFixed(1)+' cm';
+    var z=KYU.plateZone(plate.xCm, plate.hCm, {lowCm:sett.zoneLowCm, highCm:sett.zoneHighCm, widthCm:KYU.REAR_PLATE_WIDTH_M*100});
+    zTxt= z.inZone ? 'ゾーン内の目安'
+         : (!z.widthOk ? 'ゾーン外（左右）の目安' : 'ゾーン外（高さ）の目安');
+    note='通過推定 F'+pad(frameNoOf(plate.passT),4)+'（到達 '+plate.passT.toFixed(3)+'s − 捕球点後方 '+plate.mittBehindM.toFixed(1)+'m ÷ 終速）'+
+         ' ・ ゾーン目安: 幅43.2cm・高さ '+sett.zoneLowCm+'〜'+sett.zoneHighCm+'cm'+
+         ' ・ 左右=プレート中心からのcm（画像右＋）・高さ=プレート面から上向きcm ・ px/mは縦横同一（rearPxPerMeter）の一次近似';
+  }
+  return '<div class="plate-sec"><div class="row-label" style="margin-top:8px">プレート通過位置（後方専用）</div>'+
+    '<div class="tiles ptiles">'+
+      pt('プレート左右', xTxt, 'cm ・ 画像右が＋')+
+      pt('プレート高さ', hTxt, 'cm ・ プレート面から上向き')+
+      pt('ゾーン目安', zTxt, note)+
+    '</div></div>';
+}
 // 球速（特大ヒーロー＝推定初速）＋12タイル（3列×4行）のグリッドを組み立てる
 function resultPanelHTML(r, excludeId){
   var heroKmh = r.kmhInit!=null ? r.kmhInit : r.kmh; // ヒーロー表示球速（推定初速優先）
@@ -3390,7 +3546,7 @@ function resultPanelHTML(r, excludeId){
       tile('縦変化量（実験）', ivbVal, ivbSub)+
       tile('終速（推定）', plateKmh!=null ? plateKmh.toFixed(1) : '—', plateKmh!=null ? 'km/h ・ 初速'+heroKmh.toFixed(1)+'×e^(−kD)' : 'km/h')+
       tile('減衰率', decayPct!=null ? decayPct.toFixed(1)+' %' : '—', '初速→終速の空気抵抗減衰（k≈0.00727/m）')+
-    '</div></div>';
+    '</div>'+ plateTilesHTML() + '</div>'; // v0.15: プレート通過位置タイル群は12タイルの外側に追加（構成不変）
 }
 function renderQuickResult(){
   if(els.qResultCard.hidden) return;
@@ -4223,9 +4379,16 @@ function makeRecord(r, o){
   if(isRear()){
     if(o.source==='detail' || !o.source) rec.source='rear-auto';
     if(state.rearResult && state.rearResult.relClass!=null) rec.relClass=state.rearResult.relClass;
-    var rp=(state.rearCalib && typeof state.rearCalib.pxPerM==='number' && isFinite(state.rearCalib.pxPerM) && state.rearCalib.pxPerM>0)
-      ? state.rearCalib.pxPerM : null;
+    var rp=rearCalibPxPerM();
     if(rp!=null) rec.rearPxPerMeter=rp;
+    // v0.15: 捕球点の後方距離を記録へ含める（設定値。後方校正データと同じく動画ごとに保持）
+    rec.mittBehindM=rearPlateSettings().mittBehindM;
+    // v0.15: プレート通過位置は検出成功時のみ記録へ含める（位置なしのときは球速のみ）
+    var pl=state.rearResult && state.rearResult.plate;
+    if(pl && pl.found && typeof pl.xCm==='number' && isFinite(pl.xCm) && typeof pl.hCm==='number' && isFinite(pl.hCm)){
+      rec.plateXcm=pl.xCm; rec.plateHcm=pl.hCm;
+      rec.plateNote='プレート通過位置（左右=画像右＋cm・高さ=上向きcm）。px/mはrearPxPerMeterを縦横同一とみなす一次近似';
+    }
   }
   return rec;
 }
@@ -4278,7 +4441,10 @@ function renderRecords(){
       ' ・ '+r.fps+'fps ・ '+r.frames+'F ・ 実効'+r.eff.toFixed(2)+'m ・ ±'+r.accKmh.toFixed(1)+'km/h'+
       (r.source?' ・ '+(r.source.indexOf('quick')===0?'クイック自動推定':'手動計測'):'')+
       (typeof r.plateKmh==='number' && isFinite(r.plateKmh)?' ・ 終速'+r.plateKmh.toFixed(1)+'km/h':'')+
-      (typeof r.ivbCm==='number' && isFinite(r.ivbCm)?' ・ IVB +'+r.ivbCm.toFixed(1)+'cm':'')
+      (typeof r.ivbCm==='number' && isFinite(r.ivbCm)?' ・ IVB +'+r.ivbCm.toFixed(1)+'cm':'')+
+      // v0.15: プレート通過位置（後方モード・検出成功時のみ記録されている）
+      (typeof r.plateXcm==='number' && isFinite(r.plateXcm) && typeof r.plateHcm==='number' && isFinite(r.plateHcm)
+        ? ' ・ プレート通過 左右'+(r.plateXcm>=0?'+':'')+r.plateXcm.toFixed(1)+'cm・高さ'+r.plateHcm.toFixed(1)+'cm（一次近似）' : '')
     info.appendChild(top); info.appendChild(sub);
     var btns=document.createElement('div'); btns.className='rec-btns';
     var share=document.createElement('button'); share.className='btn btn-small'; share.textContent='共有画像';
@@ -4634,21 +4800,22 @@ function renderCalibMarkers(){
   var v=els.video;
   if(!(v.videoWidth>0) || !(v.videoHeight>0)) return;
   var rect=v.getBoundingClientRect();
-  function dot(pt, label){
+  function dot(pt, label, opt){
     var pos=KYU.videoPxToPercent(pt.x, pt.y, v.videoWidth, v.videoHeight, rect.width, rect.height);
     if(!pos) return;
+    opt=opt||{};
     var d=document.createElement('div');
-    d.className='calib-dot';
+    d.className='calib-dot'+(opt.cls?' '+opt.cls:'');
     d.style.position='absolute';
     d.style.left=pos.left+'%'; d.style.top=pos.top+'%';
-    d.style.width='20px'; d.style.height='20px';
-    d.style.margin='-10px 0 0 -10px';
+    d.style.width=(opt.size||20)+'px'; d.style.height=(opt.size||20)+'px';
+    d.style.margin='-'+((opt.size||20)/2)+'px 0 0 -'+((opt.size||20)/2)+'px';
     d.style.borderRadius='50%';
-    d.style.background='rgba(255,213,79,0.95)';
-    d.style.border='2px solid #d23b3b';
+    d.style.background=opt.bg||'rgba(255,213,79,0.95)';
+    d.style.border='2px solid '+(opt.border||'#d23b3b');
     d.style.pointerEvents='none';
     d.style.display='flex'; d.style.alignItems='center'; d.style.justifyContent='center';
-    d.style.fontSize='10px'; d.style.fontWeight='700'; d.style.color='#3a1010';
+    d.style.fontSize='10px'; d.style.fontWeight='700'; d.style.color=opt.color||'#3a1010';
     d.textContent=label;
     calibOverlay.appendChild(d);
   }
@@ -4656,6 +4823,11 @@ function renderCalibMarkers(){
   pts.forEach(function(pt, i){ dot(pt, CALIB_LABELS[i]||String(i+1)); });
   var rpts=(state.rearCalib && state.rearCalib.points) || [];
   rpts.forEach(function(pt, i){ dot(pt, REAR_CALIB_LABELS[i]||String(i+1)); });
+  // v0.15: プレート通過位置の検出マーカー（rearで検出成功時のみ。通過フレーム上のボール重心位置）
+  var rr=state.rearResult;
+  if(isRear() && rr && rr.plate && rr.plate.found && rr.plate.ballPx){
+    dot(rr.plate.ballPx, '通過', {cls:'plate-dot', bg:'rgba(80,220,120,0.95)', border:'#0a7d2c', color:'#062b10', size:22});
+  }
 }
 
 /* ---- §13 v0.4 後方校正カード（rear時のみ有効・JS生成UI。HTMLは無変更） ----
@@ -4673,21 +4845,41 @@ function buildRearCalibUI(){
   card.className='card'; card.id='rearCalibCard';
   card.innerHTML=
     '<h2>後方校正（ホームベース幅タップ・rear専用）</h2>'+
-    '<p class="muted small">後方撮影では、ホームベース前端の左端と右端の2点をタップし、実幅43.2cmからプレート面の px/m（rearPxPerMeter）を算出します。動画を読み替えるとリセットされます。球速計算（フレームタイミング法）自体は校正なしでも動きます。この縮尺は将来のプレート通過位置表示の基礎データです。</p>'+
+    '<p class="muted small">後方撮影では、ホームベース前端の左端と右端の2点をタップし、実幅43.2cmからプレート面の px/m（rearPxPerMeter）を算出します。動画を読み替えるとリセットされます。球速計算（フレームタイミング法）自体は校正なしでも動きます。この縮尺はプレート通過位置の計測に使います。</p>'+
     '<div class="mark-row" style="margin-top:8px">'+
       '<button class="btn btn-primary" id="rearCalibStartBtn" disabled>後方校正を開始</button>'+
       '<button class="btn btn-accent" id="rearCalibCancelBtn" hidden>キャンセル</button>'+
     '</div>'+
     '<p id="rearCalibStatus" class="muted small" style="margin-top:6px"></p>'+
-    '<p id="rearCalibResult" class="small" style="margin-top:2px;font-weight:700"></p>';
+    '<p id="rearCalibResult" class="small" style="margin-top:2px;font-weight:700"></p>'+
+    // v0.15: プレート通過位置の計測設定（捕球点後方距離・ゾーン高さ）。後方校正データと同じく動画ごとに保持（読み替えで既定値に戻る）
+    '<div class="mark-row" style="margin-top:8px;flex-wrap:wrap;gap:6px">'+
+      '<label class="small">捕球点の後方距離 <input id="rearMittBehindM" type="number" min="0" max="5" step="0.1" style="width:4.5em"> m</label>'+
+      '<label class="small">ゾーン下限 <input id="rearZoneLowCm" type="number" min="0" max="200" step="1" style="width:4em"> cm</label>'+
+      '<label class="small">ゾーン上限 <input id="rearZoneHighCm" type="number" min="0" max="200" step="1" style="width:4em"> cm</label>'+
+    '</div>'+
+    '<p class="muted small" style="margin-top:4px">プレート通過位置は後方校正済みの場合のみ有効です（未校正なら校正を促す表示になります。球速は校正なしで計測できます）。通過時刻 = 到達時刻 − 捕球点の後方距離 ÷ プレート通過速度（終速推定 plateKmh）。左右 = プレート中心からのcm（画像右が＋）、高さ = プレート面から上向きのcm。px/m は rearPxPerMeter を縦横同一とみなす一次近似です。これらの設定は動画ごとに保持され、読み替えると既定値（0.8m・45〜110cm）に戻ります。</p>';
   var anchor=(calibEls && calibEls.card) || els.video.closest('.card'); // タップ校正カードの直後に挿入
   (anchor && anchor.parentNode ? anchor.parentNode : els.detailView).insertBefore(card, anchor ? anchor.nextSibling : null);
   rearCalibEls={
     card:card, start:$('rearCalibStartBtn'), cancel:$('rearCalibCancelBtn'),
-    status:$('rearCalibStatus'), result:$('rearCalibResult')
+    status:$('rearCalibStatus'), result:$('rearCalibResult'),
+    mitt:$('rearMittBehindM'), zoneLow:$('rearZoneLowCm'), zoneHigh:$('rearZoneHighCm')
   };
   rearCalibEls.start.addEventListener('click', function(){ startRearCalibration(); });
   rearCalibEls.cancel.addEventListener('click', function(){ cancelRearCalibration(); });
+  // v0.15: 設定入力（動画ごとに保持。永続化は既存の校正と同じ扱い＝localStorageには載せず動画ごとにリセット）
+  function onRearSettingInput(){
+    var c=state.rearCalib;
+    var m=parseFloat(rearCalibEls.mitt.value), lo=parseFloat(rearCalibEls.zoneLow.value), hi=parseFloat(rearCalibEls.zoneHigh.value);
+    if(isFinite(m) && m>=0 && m<=5) c.mittBehindM=Math.round(m*10)/10;
+    if(isFinite(lo) && lo>=0 && lo<=200) c.zoneLowCm=Math.round(lo);
+    if(isFinite(hi) && hi>=0 && hi<=200) c.zoneHighCm=Math.round(hi);
+    updateRearCalibUI(); updateResult(); renderRearModeResult(); // ゾーン目安・結果表示へ即時反映
+  }
+  rearCalibEls.mitt.addEventListener('input', onRearSettingInput);
+  rearCalibEls.zoneLow.addEventListener('input', onRearSettingInput);
+  rearCalibEls.zoneHigh.addEventListener('input', onRearSettingInput);
   updateRearCalibUI();
 }
 function startRearCalibration(){
@@ -4702,9 +4894,22 @@ function cancelRearCalibration(){
   state.rearCalib.active=false; state.rearCalib.points=[];
   renderCalibMarkers(); updateRearCalibUI();
 }
-function resetRearCalib(){ // 動画を読み替えたら後方校正もリセット（側面校正と同じ方針）
-  state.rearCalib={active:false, points:[], pxPerM:null};
+function resetRearCalib(){ // 動画を読み替えたら後方校正もリセット（側面校正と同じ方針。v0.15: 捕球点距離・ゾーン高さも既定値に戻す）
+  state.rearCalib={active:false, points:[], pxPerM:null, mittBehindM:KYU.MITT_BEHIND_M_DEFAULT, zoneLowCm:KYU.ZONE_LOW_CM, zoneHighCm:KYU.ZONE_HIGH_CM};
   renderCalibMarkers(); updateRearCalibUI();
+}
+// 後方校正データから有効な px/m を返す（未校正なら null）
+function rearCalibPxPerM(){
+  var c=state.rearCalib;
+  return (c && typeof c.pxPerM==='number' && isFinite(c.pxPerM) && c.pxPerM>0) ? c.pxPerM : null;
+}
+// 捕球点のプレート前端からの後方距離[m]（設定。既定0.8m）とゾーン高さ設定[cm]を後方校正データから返す
+function rearPlateSettings(){
+  var c=state.rearCalib||{};
+  var mitt=(typeof c.mittBehindM==='number' && isFinite(c.mittBehindM) && c.mittBehindM>=0) ? c.mittBehindM : KYU.MITT_BEHIND_M_DEFAULT;
+  var low=(typeof c.zoneLowCm==='number' && isFinite(c.zoneLowCm) && c.zoneLowCm>=0) ? c.zoneLowCm : KYU.ZONE_LOW_CM;
+  var high=(typeof c.zoneHighCm==='number' && isFinite(c.zoneHighCm) && c.zoneHighCm>low) ? c.zoneHighCm : KYU.ZONE_HIGH_CM;
+  return {mittBehindM:mitt, zoneLowCm:low, zoneHighCm:high};
 }
 function addRearCalibPoint(pt){
   var c=state.rearCalib;
@@ -4746,6 +4951,12 @@ function updateRearCalibUI(){
   rearCalibEls.result.textContent = (typeof c.pxPerM==='number' && isFinite(c.pxPerM) && c.pxPerM>0)
     ? 'プレート面 '+c.pxPerM.toFixed(1)+' px/m（rearPxPerMeter・ホームベース幅 43.2cm 換算）'
     : '';
+  // v0.15: 設定入力へ現在値を反映（フォーカス中は上書きしない）
+  var s=rearPlateSettings();
+  var ae=(typeof document!=='undefined' && document.activeElement) ? document.activeElement : null;
+  if(rearCalibEls.mitt && ae!==rearCalibEls.mitt) rearCalibEls.mitt.value=String(s.mittBehindM);
+  if(rearCalibEls.zoneLow && ae!==rearCalibEls.zoneLow) rearCalibEls.zoneLow.value=String(s.zoneLowCm);
+  if(rearCalibEls.zoneHigh && ae!==rearCalibEls.zoneHigh) rearCalibEls.zoneHigh.value=String(s.zoneHighCm);
 }
 
 /* ---- Phase 3-B: ボール軌道抽出と縦変化量の実験表示（詳細モード・JS生成UI。HTMLは無変更） ----
@@ -5353,6 +5564,110 @@ function rearRefineRelease(candidateT, cx, cy, poseFrames, o){
     };
   });
 }
+/* ---- v0.15 プレート通過位置（後方モード専用・後方校正済みの場合のみ有効） ----
+   検出: 通過フレームと基準フレーム（リリース時点＝ボールはまだ手元でプレートROI外）を作業解像度
+   （幅 FINE_MAX_W 相当上限。二段抽出の精段と同じスケール）で読み、プレート周辺ROI（KYU.plateRoiPx:
+   左右はプレート幅の各1.5倍・高さはプレート面から上約1.6m相当までに限定）に絞った基準フレーム差分の
+   強度重み付き重心（KYU.centroidInRoi。二段抽出の精段と同じ仕組み）をボール位置とする。
+   o.getGrayWork(i) を渡せばそのフレーム取得を使う（テスト用合成入力）。無ければ動画をキャンバスで読む。
+   戻り値 Promise: {ball:{x,y}（実映像px）, n, w, roi} または null（検出失敗） */
+function detectPlatePassAt(v, passIdx, refIdx, o){
+  o=o||{};
+  var vw=(v && v.videoWidth>0) ? v.videoWidth : Math.floor(Number(o.width)||0);
+  var vh=(v && v.videoHeight>0) ? v.videoHeight : Math.floor(Number(o.height)||0);
+  if(!(vw>0) || !(vh>0)) return Promise.resolve(null);
+  var roi=KYU.plateRoiPx(o.plateLeft, o.plateRight, o.pxPerM, vw, vh);
+  if(!roi) return Promise.resolve(null);
+  var s=Math.min(1, FINE_MAX_W/vw); // 精段と同じ作業スケール（幅1280相当が上限）
+  var Ww=Math.max(SCAN_W, Math.round(vw*s)), Wh=Math.max(SCAN_H, Math.round(vh*s));
+  // ROIを作業座標へ（実映像px × s）
+  var rw={x0:Math.max(0, Math.round(roi.x0*s)), y0:Math.max(0, Math.round(roi.y0*s)),
+          x1:Math.min(Ww-1, Math.round(roi.x1*s)), y1:Math.min(Wh-1, Math.round(roi.y1*s))};
+  var getGrayWork=o.getGrayWork;
+  if(!getGrayWork){
+    var ft0=(state.frameTimes && state.frameTimes.length) ? state.frameTimes : null;
+    var fpsEff0=KYU.fpsFromFrameTimes(ft0)||state.fps;
+    var tOf=function(i){ return ft0 ? KYU.timeOfFrame(ft0, i) : i/fpsEff0; };
+    var cv=null, cx=null;
+    getGrayWork=function(i){
+      return seekVideo(v, tOf(i)).then(function(){
+        if(!cv){ cv=document.createElement('canvas'); cx=cv.getContext('2d',{willReadFrequently:true}); }
+        if(cv.width!==Ww || cv.height!==Wh){ cv.width=Ww; cv.height=Wh; }
+        try{ cx.drawImage(v,0,0,vw,vh,0,0,Ww,Wh); }catch(e){ return null; }
+        try{ return {gray:KYU.toGray(cx.getImageData(0,0,Ww,Wh).data), W:Ww, H:Wh}; }catch(e){ return null; }
+      });
+    };
+  }
+  var passI=Math.max(0, Math.round(Number(passIdx)||0));
+  var refI=Math.max(0, Math.round(Number(refIdx)||0));
+  return Promise.all([Promise.resolve(getGrayWork(refI)), Promise.resolve(getGrayWork(passI))]).then(function(g){
+    var ref=g[0], cur=g[1];
+    if(!ref || !cur || !ref.gray || !cur.gray) return null;
+    var W=Math.floor(Number(ref.W!=null?ref.W:ref.width)||Ww), H=Math.floor(Number(ref.H!=null?ref.H:ref.height)||Wh);
+    var Wc=Math.floor(Number(cur.W!=null?cur.W:cur.width)||W), Hc=Math.floor(Number(cur.H!=null?cur.H:cur.height)||H);
+    if(Wc!==W || Hc!==H || ref.gray.length<W*H || cur.gray.length<W*H) return null;
+    var c=KYU.centroidInRoi(ref.gray, cur.gray, W, H, rw, FINE_DIFF_THR); // 基準フレーム差分＋重心（精段と同じしきい値）
+    if(!c || c.n<KYU.PLATE_MIN_PX) return null;
+    return {ball:{x:c.x/s, y:c.y/s}, n:c.n, w:c.w, roi:roi}; // 実映像pxへ戻す
+  });
+}
+// v0.15: プレート通過位置の計測（rear専用）。state.rearResult.plate に結果を格納する。
+//   通過時刻 = 到達時刻 − 捕球点後方距離 ÷ プレート通過速度（既存の終速推定 plateKmh を使用。KYU.platePassTime）→
+//   通過フレーム特定 → detectPlatePassAt でプレートROIのボール重心 → KYU.platePositionFromPx で左右cm・高さcm。
+//   未校正なら {found:false, reason:'uncalibrated'}（UIで校正を促す。球速は従来どおり校正なしで動く）。
+//   検出失敗時は {found:false, reason:'no-ball'}（位置なし＝球速のみで記録）。
+//   o: {releaseT, arrivalT, getGrayWork}（テスト用注入。無ければ state のマークと動画から取得）
+//   戻り値 Promise: state.rearResult.plate
+function measureRearPlatePass(o){
+  o=o||{};
+  var rr=state.rearResult;
+  if(!isRear() || !rr) return Promise.resolve(null);
+  var c=state.rearCalib||{};
+  var sett=rearPlateSettings();
+  var releaseT=(o.releaseT!=null)?o.releaseT:((rr.releaseT!=null)?rr.releaseT:state.releaseTime);
+  var arrivalT=(o.arrivalT!=null)?o.arrivalT:((rr.arrivalT!=null)?rr.arrivalT:state.arrivalTime);
+  if(releaseT==null || arrivalT==null || !(arrivalT>releaseT)){
+    rr.plate={found:false, reason:'no-marks', mittBehindM:sett.mittBehindM};
+    return Promise.resolve(rr.plate);
+  }
+  var ppm=rearCalibPxPerM();
+  var plateL=c.points && c.points[0], plateR=c.points && c.points[1];
+  if(ppm==null || !plateL || !plateR){
+    rr.plate={found:false, reason:'uncalibrated', passT:null, passIdx:null, mittBehindM:sett.mittBehindM};
+    return Promise.resolve(rr.plate);
+  }
+  var r=computeResultAt(releaseT, arrivalT);
+  var speedKmh=(r.status==='ok') ? ((typeof r.plateKmh==='number' && isFinite(r.plateKmh)) ? r.plateKmh
+                 : (r.kmhInit!=null ? r.kmhInit : r.kmh)) : null;
+  var passT=KYU.platePassTime(arrivalT, sett.mittBehindM, speedKmh);
+  if(passT==null){
+    rr.plate={found:false, reason:'no-speed', mittBehindM:sett.mittBehindM};
+    return Promise.resolve(rr.plate);
+  }
+  var ft=(state.frameTimes && state.frameTimes.length) ? state.frameTimes : null;
+  var fpsEff=KYU.fpsFromFrameTimes(ft)||state.fps;
+  var passIdx= ft ? KYU.frameIndexAt(ft, passT) : Math.round(passT*fpsEff);
+  var relIdx= ft ? KYU.frameIndexAt(ft, releaseT) : Math.round(releaseT*fpsEff);
+  var refIdx=Math.max(0, Math.min(passIdx-1, relIdx)); // リリース時点を基準フレームに（ボールはまだ手元＝ROI外）
+  return detectPlatePassAt(els.video, passIdx, refIdx, {
+    plateLeft:plateL, plateRight:plateR, pxPerM:ppm, getGrayWork:o.getGrayWork
+  }).then(function(det){
+    var plate={found:false, passT:passT, passIdx:passIdx, refIdx:refIdx, mittBehindM:sett.mittBehindM, pxPerM:ppm};
+    if(det && det.ball){
+      var pos=KYU.platePositionFromPx(det.ball, plateL, plateR);
+      if(pos){
+        plate.found=true; plate.ballPx=det.ball; plate.xCm=pos.xCm; plate.hCm=pos.hCm;
+        plate.pxPerM=pos.pxPerM; plate.nPx=det.n; plate.centerX=pos.centerX; plate.plateY=pos.plateY;
+      }else{
+        plate.reason='no-scale';
+      }
+    }else{
+      plate.reason='no-ball'; // 検出失敗時は位置なし（球速のみ）で記録
+    }
+    rr.plate=plate;
+    return plate;
+  });
+}
 // 後方球速モードの自動計測: 姿勢推定でリリース候補 → ±40ms窓の差分で分離検出（クラス判定） → 捕球音オンセットで到達 → 球速計算
 function runRearAuto(){
   if(rearRunning) return Promise.resolve(null);
@@ -5392,14 +5707,26 @@ function runRearAuto(){
           sepFound:ref.sepFound, sepIndex:ref.sepAbsIndex!=null?ref.sepAbsIndex:ref.sepIndex,
           arrivalT:(arr!=null?arr:null), arrivalSource:(arr!=null?'audio-onset':'manual'), confirmed:false
         };
-        updateMarks(); updateResult(); renderRearModeResult(); updateRearModeUI();
-        setRearModeProgress(100, '完了');
-        if(arr==null){
-          setRearModeStatus('音声から捕球音オンセットを検出できませんでした。到達点は「到達点をマーク」ボタンで手動設定してください（手動マークにフォールバック）。リリース時刻はクラス'+ref.relClass+'で確定しています');
-        }else{
-          setRearModeStatus('到達候補: 捕球音オンセット '+arr.toFixed(3)+'s（音速遅延補正 -'+Math.round(KYU.soundDelaySec(state.camDistM)*1000)+'ms適用）。信頼性クラス '+ref.relClass+' でリリース='+ref.releaseT.toFixed(3)+'s に確定しました');
-        }
-        return state.rearResult;
+        // v0.15: プレート通過位置を計測（rear専用。校正済みの場合のみ有効・未校正/検出失敗時は位置なしで球速のみ）
+        return measureRearPlatePass({releaseT:ref.releaseT, arrivalT:(arr!=null?arr:state.arrivalTime)}).then(function(plate){
+          renderCalibMarkers(); // 通過フレームのボール検出マーカーを動画上に描画
+          updateMarks(); updateResult(); renderRearModeResult(); updateRearModeUI();
+          setRearModeProgress(100, '完了');
+          var plateMsg='';
+          if(plate && plate.found){
+            plateMsg=' プレート通過位置: 左右'+(plate.xCm>=0?'+':'')+plate.xCm.toFixed(1)+'cm・高さ'+plate.hCm.toFixed(1)+'cm（通過推定 F'+pad(frameNoOf(plate.passT),4)+'）';
+          }else if(plate && plate.reason==='uncalibrated'){
+            plateMsg=' プレート通過位置: 未校正のため計測していません（後方校正を実施してください。球速は計測済み）';
+          }else if(plate){
+            plateMsg=' プレート通過位置: 検出できませんでした（球速のみ）';
+          }
+          if(arr==null){
+            setRearModeStatus('音声から捕球音オンセットを検出できませんでした。到達点は「到達点をマーク」ボタンで手動設定してください（手動マークにフォールバック）。リリース時刻はクラス'+ref.relClass+'で確定しています'+plateMsg);
+          }else{
+            setRearModeStatus('到達候補: 捕球音オンセット '+arr.toFixed(3)+'s（音速遅延補正 -'+Math.round(KYU.soundDelaySec(state.camDistM)*1000)+'ms適用）。信頼性クラス '+ref.relClass+' でリリース='+ref.releaseT.toFixed(3)+'s に確定しました'+plateMsg);
+          }
+          return state.rearResult;
+        });
       });
     });
   }).catch(function(e){
@@ -5423,6 +5750,21 @@ function confirmRearResult(){
   updateResult(); renderRearModeResult(); updateRearModeUI();
   toast('この時刻で確定しました。保存できます');
 }
+// v0.15: プレート通過位置の1行表示テキスト（rearカード内。検出成功時は左右/高さcm＋ゾーン目安、他は「—」＋理由）
+function plateLineText(rr){
+  var plate=rr && rr.plate;
+  if(!plate) return '—（未計測）';
+  if(!plate.found){
+    if(plate.reason==='uncalibrated') return '—（未校正のため計測不可。後方校正を実施してください。球速は計測済み）';
+    if(plate.reason==='no-marks' || plate.reason==='no-speed') return '—（時刻未確定のため未計測）';
+    return '—（プレートROIでボールを検出できず・球速のみ）';
+  }
+  var sett=rearPlateSettings();
+  var z=KYU.plateZone(plate.xCm, plate.hCm, {lowCm:sett.zoneLowCm, highCm:sett.zoneHighCm, widthCm:KYU.REAR_PLATE_WIDTH_M*100});
+  return '左右'+(plate.xCm>=0?'+':'')+plate.xCm.toFixed(1)+'cm ・ 高さ'+plate.hCm.toFixed(1)+'cm'+
+    '（'+(z.inZone?'ゾーン内':(!z.widthOk?'ゾーン外・左右':'ゾーン外・高さ'))+'の目安・通過推定 F'+pad(frameNoOf(plate.passT),4)+
+    ' ・ px/mは縦横同一の一次近似）';
+}
 // 後方球速モードの結果（クラスと内訳）をカード内へ表示
 function renderRearModeResult(){
   if(!rearModeEls) return;
@@ -5443,7 +5785,9 @@ function renderRearModeResult(){
     '<div class="rec-top"><span class="rec-name">到達候補</span><span class="rec-kmh">'+(rr.arrivalSource==='audio-onset'
       ? '捕球音オンセット '+(rr.arrivalT!=null?rr.arrivalT.toFixed(3)+'s':'')+'（音速遅延補正済み）'
       : '手動マークにフォールバック（音声から捕球音を検出できませんでした）')+'</span></div>'+
-    '<div class="rec-top"><span class="rec-name">球速</span><span class="rec-kmh">'+kmhTxt+'</span></div>';
+    '<div class="rec-top"><span class="rec-name">球速</span><span class="rec-kmh">'+kmhTxt+'</span></div>'+
+    // v0.15: プレート通過位置（rear専用。校正済み＋検出成功時のみ値あり）
+    '<div class="rec-top"><span class="rec-name">プレート通過位置</span><span class="rec-kmh">'+plateLineText(rr)+'</span></div>';
   updateRearModeUI();
 }
 
@@ -5519,6 +5863,9 @@ if(typeof module!=='undefined' && module.exports){
     rearRunning:function(){ return rearRunning; },
     rearModeEls:function(){ return rearModeEls; },
     rearResultNote:rearResultNote,
+    detectPlatePassAt:detectPlatePassAt, measureRearPlatePass:measureRearPlatePass,
+    plateTilesHTML:plateTilesHTML, plateLineText:plateLineText,
+    rearCalibPxPerM:rearCalibPxPerM, rearPlateSettings:rearPlateSettings,
     buildRec:buildRec, autoSaveQuick:autoSaveQuick, q:q
   };
 }
