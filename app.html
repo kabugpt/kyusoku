@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.15 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.16 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -3894,6 +3894,88 @@ function buildBatchRows(cands, motion){
   });
   return rows;
 }
+/* ---- v0.16 一括解析の後方精密化パス（rear時のみ。sideでは一切実行しない＝従来どおり） ----
+   各検出投球（区間）について、区間内の推定リリース付近を中心に姿勢推定を行い、詳細画面の後方球速と同じ品質
+   （姿勢候補→分離精密化→信頼性クラスA/B/C→区間内の捕球音オンセットで到達確定→校正済みならプレート通過位置）まで引き上げる。
+   姿勢推定モデルはバッチ全体で1回だけ読み込み、Landmarkerを区間ごとに使い回す（区間ごとに読み直さない）。
+   モデル読み込みや各投球の姿勢推定・精密化が失敗した場合は、その投球を従来のバッチ推定のままクラスC・要確認
+   （保存チェック外）として残し、バッチ全体は止めない。
+   opts: {onProgress(pct,msg), createLandmarker(), getGray, getGrayWork, estimate}（いずれもテスト用注入。無ければ実実装）
+   rawPeakSecs: scanAudioPeaks の生の捕球音ピーク秒列（firstAudioOnsetAfter が音速遅延補正を自分で適用する） */
+var BATCH_REAR_PRE_SEC=1.0;        // 区間内の推定リリースから前方向に姿勢推定する窓（秒）
+var BATCH_REAR_POST_SEC=0.6;       // 後方向の窓（秒）
+var BATCH_REAR_ARR_MARGIN_SEC=0.5; // 精密化後の到達が区間の到達推定からこの秒数以上後なら区間推定を維持する
+function refineBatchRowsRear(v, rows, rawPeakSecs, opts){
+  opts=opts||{};
+  rows=rows||[];
+  if(!isRear() || !rows.length) return Promise.resolve(rows);
+  var onProgress=opts.onProgress||function(){};
+  var calibrated=rearCalibPxPerM()!=null;
+  var lm=null;
+  var loadP=(opts.createLandmarker)
+    ? Promise.resolve(opts.createLandmarker())
+    : poseCreateLandmarker(function(p,m){ onProgress(0.02, m); });
+  return loadP.then(function(l){
+    lm=l;
+    var i=0;
+    function markFallback(row, reason){
+      // 従来のバッチ推定のままクラスC・要確認として残す（バッチ全体は止めない）
+      row.relClass='C'; row.refined=false; row.checked=false; row.plate=null;
+      row.note='要確認（'+(reason||'姿勢推定に失敗したため従来の区間推定のまま')+'。タップして詳細画面で手動確認してください）';
+    }
+    function next(){
+      if(i>=rows.length || batch.cancel) return rows;
+      var row=rows[i++];
+      var p0=0.05+0.9*(i-1)/rows.length, p1=0.05+0.9*i/rows.length;
+      onProgress(p0, '#'+row.n+' を後方精密化中…');
+      // 1投球分の後方精密化は詳細画面と同じ rearRefineOne（姿勢候補→分離精密化→クラス判定→捕球音到達）
+      return rearRefineOne(v, row.releaseTime, BATCH_REAR_PRE_SEC, BATCH_REAR_POST_SEC, rawPeakSecs, {
+        lm:lm, getGray:opts.getGray, estimate:opts.estimate,
+        onProgress:function(p,m){ onProgress(p0+(p1-p0)*p, '#'+row.n+' '+m); }
+      }).then(function(ref){
+        // 到達は区間内の捕球音オンセットで確定。区間から大きく外れる場合は従来の区間推定を維持
+        var arr=ref.arrivalT, src=ref.arrivalSource;
+        if(arr==null || arr>row.arrivalTime+BATCH_REAR_ARR_MARGIN_SEC){ arr=row.arrivalTime; src=row.arrivalSource; }
+        if(!(arr>ref.releaseT)) throw new Error('精密化後のリリース時刻が到達より後になりました');
+        var r=computeResultAt(ref.releaseT, arr);
+        if(r.status!=='ok') throw new Error(r.msg||'球速計算に失敗しました');
+        row.releaseTime=ref.releaseT; row.arrivalTime=arr;
+        row.releaseIdx=frameNoOf(ref.releaseT); row.arrivalIdx=frameNoOf(arr);
+        if(src==='audio-onset') row.arrivalSource='audio';
+        row.result=r; row.relClass=ref.relClass; row.refined=true;
+        row.candidateT=ref.candidateT; row.sepFound=ref.sepFound; row.sepIndex=ref.sepIndex;
+        row.checked=(ref.relClass!=='C'); // クラスCは初期チェック外（詳細画面で手動確認してから保存）
+        if(ref.relClass==='C'){
+          row.note='要確認（姿勢候補のみで分離を確認できませんでした。タップして詳細画面で手動確認してください）';
+        }
+        if(calibrated){
+          // v0.15/v0.16: 後方校正済みなら各投球にもプレート通過位置を付ける（未校正なら球速のみ）
+          return computeRearPlatePass({releaseT:ref.releaseT, arrivalT:arr, getGrayWork:opts.getGrayWork}).then(function(plate){
+            row.plate=(plate && plate.found) ? plate : null;
+            return next();
+          }, function(){ row.plate=null; return next(); });
+        }
+        return next();
+      }).catch(function(e){
+        markFallback(row, (e && e.message) ? e.message : '姿勢推定に失敗したため従来の区間推定のまま');
+        return next();
+      });
+    }
+    return next();
+  }).then(function(rs){
+    try{ if(lm && lm.close) lm.close(); }catch(e){}
+    return rs;
+  }, function(){
+    // モデル読み込み失敗: 全投球を従来のバッチ推定のままクラスC・要確認で残す（バッチ全体は止めない）
+    try{ if(lm && lm.close) lm.close(); }catch(e2){}
+    rows.forEach(function(row){
+      row.relClass='C'; row.refined=false; row.checked=false; row.plate=null;
+      row.note='要確認（姿勢推定モデルを読み込めなかったため従来の区間推定のまま。タップして詳細画面で手動確認してください）';
+    });
+    onProgress(0.95, '姿勢推定モデルの読み込みに失敗したため従来の区間推定のみで出力しました（全てクラスC・要確認）');
+    return rows;
+  });
+}
 function renderBatchList(){
   if(!batchEls) return;
   batchEls.list.innerHTML='';
@@ -3910,10 +3992,20 @@ function renderBatchList(){
     var hero=row.result.kmhInit!=null ? row.result.kmhInit : row.result.kmh;
     km.textContent=hero.toFixed(1)+' km/h';
     top.appendChild(nm); top.appendChild(km);
+    // v0.16: rearの後方精密化パスを通した行には信頼性クラス（A/B/C）を表示。クラスCは「要確認」つき
+    if(row.relClass){
+      var cl=document.createElement('span'); cl.className='rec-name';
+      cl.textContent='クラス'+row.relClass+(row.relClass==='C'?' ・ 要確認':'');
+      top.appendChild(cl);
+    }
     var sub=document.createElement('div'); sub.className='rec-sub';
     sub.textContent='区間平均 '+row.result.kmh.toFixed(1)+' km/h ・ F'+pad(row.releaseIdx,4)+'→F'+pad(row.arrivalIdx,4)+
       '（'+row.result.frames+'F / '+row.result.timeSec.toFixed(3)+'s） ・ 実効'+row.result.eff.toFixed(2)+'m ・ 到達:'+
-      (row.arrivalSource==='audio'?'捕球音':'動き量')+(row.note?' ・ '+row.note:'');
+      (row.arrivalSource==='audio'?'捕球音':'動き量')
+      +(row.relClass?' ・ 信頼性クラス '+row.relClass:'')
+      // v0.16: 校正済みのrearではプレート通過位置も行に表示する
+      +(row.plate&&row.plate.found?' ・ プレート 左右'+(row.plate.xCm>=0?'+':'')+row.plate.xCm.toFixed(1)+'cm・高さ'+row.plate.hCm.toFixed(1)+'cm':'')
+      +(row.note?' ・ '+row.note:'');
     info.appendChild(top); info.appendChild(sub);
     li.appendChild(cb); li.appendChild(info);
     li.addEventListener('click', function(e){ if(e.target===cb) return; openBatchRow(row); });
@@ -3928,25 +4020,50 @@ function openBatchRow(row){
   if(!state.loaded) return;
   state.releaseTime=row.releaseTime;
   state.arrivalTime=row.arrivalTime;
+  // v0.16: rear のバッチ行を開いたら詳細画面の後方球速結果にも反映する。
+  // クラスCの投球は詳細画面の既存の仕組み（クラスC保存ブロック＋「この時刻で確定」ボタン）で手動確認できる導線に乗る
+  if(isRear() && row.relClass!=null){
+    state.rearResult={
+      relClass:row.relClass, releaseT:row.releaseTime,
+      candidateT:(row.candidateT!=null)?row.candidateT:row.releaseTime,
+      sepFound:!!row.sepFound, sepIndex:(row.sepIndex!=null)?row.sepIndex:null,
+      arrivalT:row.arrivalTime,
+      arrivalSource:(row.arrivalSource==='audio')?'audio-onset':'manual',
+      confirmed:false
+    };
+    if(row.plate) state.rearResult.plate=row.plate;
+  }
   updateMarks(); updateResult();
   seekToTime(row.releaseTime).then(function(){ els.seek.value=curFrame(); updateFrameUI(); });
   els.video.scrollIntoView({behavior:'smooth', block:'center'});
   toast('#'+row.n+' を読み込みました（F'+pad(row.releaseIdx,4)+'）。コマ送りで微調整して保存できます');
 }
 // チェックの付いた投球を既存の記録保存形式（kmh/kmhInit等）で一括保存
+// v0.16: rear では詳細画面と同じ形式（source=rear-auto・relClass・校正済みなら rearPxPerMeter と
+// plateXcm/plateHcm・mittBehindM）で保存する。side のバッチ保存形式（source=batch-…）とは混ぜない
 function saveSelectedBatch(){
   var sel=batch.rows.filter(function(r){ return r.checked && !r.saved; });
   if(!sel.length){ toast('保存対象の投球がありません'); return; }
+  var rear=isRear();
+  var ppm=rear ? rearCalibPxPerM() : null;
   var all=loadAll();
   var key=todayKey();
   if(!all[key]) all[key]=[];
   sel.forEach(function(row){
-    var rec=makeRecord(row.result, {
-      source:'batch-'+(row.arrivalSource||'unknown'),
+    var o={
       fps:batch.fps,
       releaseFrame:row.releaseIdx, arrivalFrame:row.arrivalIdx,
       videoTime:row.releaseTime
-    });
+    };
+    if(rear){
+      o.source='rear-auto';
+      if(row.relClass!=null) o.relClass=row.relClass;
+      if(ppm!=null) o.rearPxPerMeter=ppm;
+      if(row.plate) o.plate=row.plate;
+    }else{
+      o.source='batch-'+(row.arrivalSource||'unknown');
+    }
+    var rec=makeRecord(row.result, o);
     all[key].push(rec);
     row.saved=true;
   });
@@ -3994,12 +4111,36 @@ function startBatch(){
       return peakSecs;
     });
   }).then(function(peakSecs){
+    // v0.16: rear では各検出投球を後方精密化パス（姿勢候補→分離精密化→クラス判定→捕球音到達→プレート位置）へ通す。
+    // side では一切実行しない（従来どおり）。姿勢推定モデルはバッチ全体で1回だけ読み込む
+    var rawPeaks=(audioPeaks && audioPeaks.length) ? audioPeaks.map(function(p){ return p.sec; }) : null;
+    var refineP=(isRear() && batch.rows.length)
+      ? refineBatchRowsRear(v, batch.rows, rawPeaks, { onProgress:function(pct, msg){
+          if(batch.cancel) return;
+          setBatchProgress(92+Math.round(pct*7), '後方精密化中… '+Math.round(pct*100)+'% '+msg);
+        } })
+      : Promise.resolve(batch.rows);
+    return refineP.then(function(){
+      if(batch.cancel) throw {cancelled:true};
+      return peakSecs;
+    });
+  }).then(function(peakSecs){
     renderBatchList();
     setBatchProgress(100, '完了');
     var n=batch.rows.length;
+    // v0.16: rear のときはクラス別の内訳もメッセージに出す
+    var rearNote='';
+    if(isRear() && n){
+      var na=batch.rows.filter(function(r){ return r.relClass==='A'; }).length;
+      var nb=batch.rows.filter(function(r){ return r.relClass==='B'; }).length;
+      var nc=batch.rows.filter(function(r){ return r.relClass==='C'; }).length;
+      rearNote=' 後方精密化: クラスA '+na+'球・B '+nb+'球・C '+nc+'球（Cは要確認のため初期チェック外）'
+        +(rearCalibPxPerM()!=null?' ・ 校正済みのためプレート通過位置も記録します':' ・ 未校正のため球速のみです');
+    }
     batchEls.msg.textContent=(peakSecs
       ? '捕球音ベースで '+n+' 球を検出しました（音速補正 -'+Math.round(KYU.soundDelaySec(state.camDistM)*1000)+'ms適用・実効fps '+batch.fps.toFixed(1)+'）'
       : '音声が使えなかったため映像の動き量のみで '+n+' 球を検出しました（実効fps '+batch.fps.toFixed(1)+'）')
+      +rearNote
       +(n ? '。行をタップするとその投球位置へシークして手動修正できます。' : '。投球を検出できませんでした。音声つき・三脚固定の動画でお試しください。');
     batchEls.save.disabled = n===0;
   }).catch(function(e){
@@ -4376,15 +4517,19 @@ function makeRecord(r, o){
   }
   // §13 v0.4 後方球速モード（Game Mode）: rear では記録の source を rear-auto とし、信頼性クラス relClass と
   // 後方校正の rearPxPerMeter（校正済みの場合）を記録へ含める
+  // （v0.16: o.relClass / o.rearPxPerMeter / o.plate を渡せばそれを優先する。
+  //   一括解析の後方精密化では投球ごとのクラス・プレート位置を state.rearResult ではなく行から渡すため）
   if(isRear()){
     if(o.source==='detail' || !o.source) rec.source='rear-auto';
-    if(state.rearResult && state.rearResult.relClass!=null) rec.relClass=state.rearResult.relClass;
-    var rp=rearCalibPxPerM();
+    var relClass=(o.relClass!=null) ? o.relClass
+      : (state.rearResult && state.rearResult.relClass!=null ? state.rearResult.relClass : null);
+    if(relClass!=null) rec.relClass=relClass;
+    var rp=(o.rearPxPerMeter!=null) ? o.rearPxPerMeter : rearCalibPxPerM();
     if(rp!=null) rec.rearPxPerMeter=rp;
     // v0.15: 捕球点の後方距離を記録へ含める（設定値。後方校正データと同じく動画ごとに保持）
     rec.mittBehindM=rearPlateSettings().mittBehindM;
     // v0.15: プレート通過位置は検出成功時のみ記録へ含める（位置なしのときは球速のみ）
-    var pl=state.rearResult && state.rearResult.plate;
+    var pl=(o.plate!=null) ? o.plate : (state.rearResult && state.rearResult.plate);
     if(pl && pl.found && typeof pl.xCm==='number' && isFinite(pl.xCm) && typeof pl.hCm==='number' && isFinite(pl.hCm)){
       rec.plateXcm=pl.xCm; rec.plateHcm=pl.hCm;
       rec.plateNote='プレート通過位置（左右=画像右＋cm・高さ=上向きcm）。px/mはrearPxPerMeterを縦横同一とみなす一次近似';
@@ -5384,9 +5529,9 @@ function runPoseAnalysis(){
    [t0,t1] 区間をシークしながらフレームごとに Pose Landmarker で推論し、ランドマーク列 [{t, landmarks}] を返す。
    CDNからライブラリ動的読み込み → Landmarker生成(GPU→WASM)。onProgress(pct 0..1, msg) で進捗通知。
    失敗時は reject（呼び出し側でカード内エラー表示のみ。アプリ本体は落とさない） */
-function poseEstimateWindow(v, t0, t1, onProgress){
-  var fpsEff=KYU.fpsFromFrameTimes(state.frameTimes)||state.fps;
-  var lm=null; // 実行中の Landmarker
+// Landmarker を1つだけ生成する（v0.16: 一括解析の後方精密化ではバッチ全体で1回だけ生成して使い回すため分離。
+// 成功時 resolve(lm)。呼び出し側が close する責務を持つ）
+function poseCreateLandmarker(onProgress){
   return poseLoadLib().then(function(lib){
     var FilesetResolver=lib.pkg.FilesetResolver, PoseLandmarker=lib.pkg.PoseLandmarker;
     if(!FilesetResolver || !PoseLandmarker) throw new Error('tasks-vision の読み込みに失敗しました（FilesetResolver/PoseLandmarker がありません）');
@@ -5401,35 +5546,44 @@ function poseEstimateWindow(v, t0, t1, onProgress){
       }
       return create('GPU').catch(function(){ return create('WASM'); }); // GPUデリゲート失敗時はWASM(CPU)へ
     });
-  }).then(function(l){
-    lm=l;
-    if(onProgress) onProgress(0.08, '姿勢推定中… '+t0.toFixed(2)+'s 〜 '+t1.toFixed(2)+'s（実効 '+fpsEff.toFixed(1)+'fps）');
-    var step=1/fpsEff;
-    var n=Math.max(1, Math.floor((t1-t0)/step));
-    var frames=[];
-    var i=0;
-    function loop(){
-      if(i>n){
-        if(onProgress) onProgress(1, '処理完了: '+(n+1)+' フレーム（ランドマーク取得 '+frames.filter(function(f){ return f.landmarks; }).length+'）');
-        return Promise.resolve(frames);
-      }
-      var t=Math.min(t0+i*step, t1);
-      return seekVideo(v, t).then(function(){
-        var lmk=null;
-        try{
-          var r=lm.detectForVideo(v, Math.round(t*1000)); // タイムスタンプは ms で単調増加が必要
-          if(r && r.landmarks && r.landmarks[0]) lmk=posePickLandmarks(r.landmarks[0]);
-        }catch(e){ lmk=null; } // 推論失敗フレームはスキップ
-        frames.push({t:t, landmarks:lmk});
-        if(i % Math.max(1, Math.floor(n/20)) === 0){
-          if(onProgress) onProgress(0.08+0.92*i/n, '姿勢推定中… '+i+'/'+(n+1)+' フレーム（'+Math.round(100*i/n)+'%）');
-          return new Promise(function(r2){ setTimeout(r2, 0); }).then(loop); // ときどきUIへ制御を戻す
-        }
-        i++;
-        return loop();
-      });
+  });
+}
+// 既存の Landmarker で [t0,t1] 区間を姿勢推定する（close は呼び出し側。v0.16 一括解析で lm を使い回すため分離）
+function poseEstimateWindowWith(lm, v, t0, t1, onProgress){
+  var fpsEff=KYU.fpsFromFrameTimes(state.frameTimes)||state.fps;
+  if(onProgress) onProgress(0.08, '姿勢推定中… '+t0.toFixed(2)+'s 〜 '+t1.toFixed(2)+'s（実効 '+fpsEff.toFixed(1)+'fps）');
+  var step=1/fpsEff;
+  var n=Math.max(1, Math.floor((t1-t0)/step));
+  var frames=[];
+  var i=0;
+  function loop(){
+    if(i>n){
+      if(onProgress) onProgress(1, '処理完了: '+(n+1)+' フレーム（ランドマーク取得 '+frames.filter(function(f){ return f.landmarks; }).length+'）');
+      return Promise.resolve(frames);
     }
-    return loop();
+    var t=Math.min(t0+i*step, t1);
+    return seekVideo(v, t).then(function(){
+      var lmk=null;
+      try{
+        var r=lm.detectForVideo(v, Math.round(t*1000)); // タイムスタンプは ms で単調増加が必要
+        if(r && r.landmarks && r.landmarks[0]) lmk=posePickLandmarks(r.landmarks[0]);
+      }catch(e){ lmk=null; } // 推論失敗フレームはスキップ
+      frames.push({t:t, landmarks:lmk});
+      var fi=i; i++;
+      if(fi % Math.max(1, Math.floor(n/20)) === 0){
+        if(onProgress) onProgress(0.08+0.92*fi/n, '姿勢推定中… '+fi+'/'+(n+1)+' フレーム（'+Math.round(100*fi/n)+'%）');
+        return new Promise(function(r2){ setTimeout(r2, 0); }).then(loop); // ときどきUIへ制御を戻す
+      }
+      return loop();
+    });
+  }
+  return loop();
+}
+function poseEstimateWindow(v, t0, t1, onProgress){
+  var lm=null; // 実行中の Landmarker
+  return poseCreateLandmarker(onProgress).then(function(l){
+    lm=l;
+    return poseEstimateWindowWith(lm, v, t0, t1, onProgress);
   }).then(function(frames){
     try{ if(lm && lm.close) lm.close(); }catch(e){}
     lm=null; poseLandmarker=null;
@@ -5440,7 +5594,6 @@ function poseEstimateWindow(v, t0, t1, onProgress){
     throw e;
   });
 }
-
 /* ---- §13 v0.4 後方球速モード（Game Mode）本体（rear時のみ有効・JS生成UI。HTMLは無変更） ----
    流れ: ①姿勢推定（poseEstimateWindow をリリース候補生成として使用）でリリース候補時刻を得る
         ②候補の前後±40msの窓を手首位置周辺ROIのフレーム差分（KYU.detectSeparation）で走査し、
@@ -5611,38 +5764,32 @@ function detectPlatePassAt(v, passIdx, refIdx, o){
     return {ball:{x:c.x/s, y:c.y/s}, n:c.n, w:c.w, roi:roi}; // 実映像pxへ戻す
   });
 }
-// v0.15: プレート通過位置の計測（rear専用）。state.rearResult.plate に結果を格納する。
+// v0.15/v0.16: プレート通過位置の計算部分（rear専用・state.rearResult には触らない純粋めの下請け。
+//   一括解析の後方精密化パスでは各投球に対してこれを直接呼び、結果をバッチ行へ付ける）
 //   通過時刻 = 到達時刻 − 捕球点後方距離 ÷ プレート通過速度（既存の終速推定 plateKmh を使用。KYU.platePassTime）→
 //   通過フレーム特定 → detectPlatePassAt でプレートROIのボール重心 → KYU.platePositionFromPx で左右cm・高さcm。
-//   未校正なら {found:false, reason:'uncalibrated'}（UIで校正を促す。球速は従来どおり校正なしで動く）。
-//   検出失敗時は {found:false, reason:'no-ball'}（位置なし＝球速のみで記録）。
-//   o: {releaseT, arrivalT, getGrayWork}（テスト用注入。無ければ state のマークと動画から取得）
-//   戻り値 Promise: state.rearResult.plate
-function measureRearPlatePass(o){
+//   未校正なら {found:false, reason:'uncalibrated'}（球速のみで記録）。検出失敗時は {found:false, reason:'no-ball'}。
+//   o: {releaseT, arrivalT, getGrayWork}（getGrayWork はテスト用注入。無ければ動画から取得）
+//   戻り値 Promise: plate オブジェクト（必ず found フラグ付き）
+function computeRearPlatePass(o){
   o=o||{};
-  var rr=state.rearResult;
-  if(!isRear() || !rr) return Promise.resolve(null);
   var c=state.rearCalib||{};
   var sett=rearPlateSettings();
-  var releaseT=(o.releaseT!=null)?o.releaseT:((rr.releaseT!=null)?rr.releaseT:state.releaseTime);
-  var arrivalT=(o.arrivalT!=null)?o.arrivalT:((rr.arrivalT!=null)?rr.arrivalT:state.arrivalTime);
+  var releaseT=o.releaseT, arrivalT=o.arrivalT;
   if(releaseT==null || arrivalT==null || !(arrivalT>releaseT)){
-    rr.plate={found:false, reason:'no-marks', mittBehindM:sett.mittBehindM};
-    return Promise.resolve(rr.plate);
+    return Promise.resolve({found:false, reason:'no-marks', mittBehindM:sett.mittBehindM});
   }
   var ppm=rearCalibPxPerM();
   var plateL=c.points && c.points[0], plateR=c.points && c.points[1];
   if(ppm==null || !plateL || !plateR){
-    rr.plate={found:false, reason:'uncalibrated', passT:null, passIdx:null, mittBehindM:sett.mittBehindM};
-    return Promise.resolve(rr.plate);
+    return Promise.resolve({found:false, reason:'uncalibrated', passT:null, passIdx:null, mittBehindM:sett.mittBehindM});
   }
   var r=computeResultAt(releaseT, arrivalT);
   var speedKmh=(r.status==='ok') ? ((typeof r.plateKmh==='number' && isFinite(r.plateKmh)) ? r.plateKmh
                  : (r.kmhInit!=null ? r.kmhInit : r.kmh)) : null;
   var passT=KYU.platePassTime(arrivalT, sett.mittBehindM, speedKmh);
   if(passT==null){
-    rr.plate={found:false, reason:'no-speed', mittBehindM:sett.mittBehindM};
-    return Promise.resolve(rr.plate);
+    return Promise.resolve({found:false, reason:'no-speed', mittBehindM:sett.mittBehindM});
   }
   var ft=(state.frameTimes && state.frameTimes.length) ? state.frameTimes : null;
   var fpsEff=KYU.fpsFromFrameTimes(ft)||state.fps;
@@ -5664,8 +5811,70 @@ function measureRearPlatePass(o){
     }else{
       plate.reason='no-ball'; // 検出失敗時は位置なし（球速のみ）で記録
     }
+    return plate;
+  });
+}
+// v0.15: プレート通過位置の計測（rear専用）。state.rearResult.plate に結果を格納する。
+//  詳細画面の後方球速モード用の薄いラッパ（計算本体は computeRearPlatePass。v0.16 一括解析と共通）
+//   o: {releaseT, arrivalT, getGrayWork}（テスト用注入。無ければ state のマークと動画から取得）
+//   戻り値 Promise: state.rearResult.plate
+function measureRearPlatePass(o){
+  o=o||{};
+  var rr=state.rearResult;
+  if(!isRear() || !rr) return Promise.resolve(null);
+  var releaseT=(o.releaseT!=null)?o.releaseT:((rr.releaseT!=null)?rr.releaseT:state.releaseTime);
+  var arrivalT=(o.arrivalT!=null)?o.arrivalT:((rr.arrivalT!=null)?rr.arrivalT:state.arrivalTime);
+  return computeRearPlatePass({releaseT:releaseT, arrivalT:arrivalT, getGrayWork:o.getGrayWork}).then(function(plate){
     rr.plate=plate;
     return plate;
+  });
+}
+// v0.16: 1投球分の後方精密化パス（詳細画面の後方球速モードと一括解析の後方精密化で共通）
+//   centerT ± (preSec, postSec) の窓で姿勢推定 → リリース候補（KYU.poseDetectReleaseCandidate）→
+//   手首ROIの分離精密化（rearRefineRelease → KYU.classifyRelease でクラスA/B/C）→
+//   到達は捕球音オンセット列のうちリリース以降で最初のもの（KYU.firstAudioOnsetAfter・音速遅延補正つき）。
+//   o.lm を渡せばその Landmarker を使う（一括解析ではバッチ全体で1つだけ生成して使い回す。無ければ自分で生成＆close）。
+//   o.estimate を渡せば姿勢推定の代わりにそれを使う（テスト用: function(t0,t1) => Promise<frames>）。
+//   o.getGray は rearRefineRelease へそのまま渡す（テスト用合成フレーム）。
+//   o.onProgress(pct 0..1, msg) で進捗通知。
+//   戻り値 Promise: {relClass, releaseT, candidateT, sepFound, sepIndex, sepDist, arrivalT, arrivalSource, poseFrames}
+//   （arrivalT は音声が取れないとき null・arrivalSource は 'audio-onset' か 'manual'）
+function rearRefineOne(v, centerT, preSec, postSec, peakSecs, o){
+  o=o||{};
+  var dur=(v && isFinite(v.duration) && v.duration>0) ? v.duration : (centerT+preSec+postSec);
+  var t0=Math.max(0, centerT-preSec), t1=Math.min(dur, centerT+postSec);
+  if(!(t1>t0)) t1=Math.min(dur, t0+1/Math.max(1,(KYU.fpsFromFrameTimes(state.frameTimes)||state.fps)));
+  var prog=function(p,m){ if(o.onProgress) o.onProgress(p,m); };
+  prog(0.02, '姿勢推定でリリース候補を生成中…');
+  var estP;
+  if(o.estimate){
+    estP=Promise.resolve(o.estimate(t0, t1)).then(function(fr){ return fr; });
+  }else if(o.lm){
+    estP=poseEstimateWindowWith(o.lm, v, t0, t1, function(p,m){ prog(0.02+0.5*p, m); });
+  }else{
+    estP=poseEstimateWindow(v, t0, t1, function(p,m){ prog(0.02+0.5*p, m); });
+  }
+  return estP.then(function(poseFrames){
+    if(!poseFrames || !poseFrames.length) throw new Error('姿勢ランドマークを取得できませんでした');
+    var rc=KYU.poseDetectReleaseCandidate(poseFrames, {hand:state.poseHand, direction:1});
+    if(!rc || rc.t==null) throw new Error('リリース候補を検出できませんでした');
+    prog(0.55, 'リリース候補 F'+pad(frameNoOf(rc.t),4)+'（'+rc.t.toFixed(3)+'s）の前後±'+KYU.REAR_SEP_WIN_MS+'msを画像差分で精密化中…');
+    var wrist=scanWristAt(poseFrames, rc.t);
+    return rearRefineRelease(rc.t, wrist?wrist.x:SCAN_W/2, wrist?wrist.y:SCAN_H/2, poseFrames, {getGray:o.getGray}).then(function(ref){
+      prog(0.75, '捕球音から到達候補を検出中…（一括解析と同じ音声オンセット検出）');
+      var arr=null, src='manual';
+      if(peakSecs && peakSecs.length){
+        var hit=KYU.firstAudioOnsetAfter(peakSecs, ref.releaseT, state.camDistM);
+        if(hit){ arr=hit.sec; src='audio-onset'; }
+      }
+      prog(0.9, 'リリース確定: クラス'+ref.relClass+' ・ リリース='+ref.releaseT.toFixed(3)+'s');
+      return {
+        relClass:ref.relClass, releaseT:ref.releaseT, candidateT:ref.candidateT,
+        sepFound:!!ref.sepFound, sepIndex:(ref.sepAbsIndex!=null?ref.sepAbsIndex:ref.sepIndex),
+        sepDist:(typeof ref.sepDist==='number')?ref.sepDist:null,
+        arrivalT:arr, arrivalSource:src, poseFrames:poseFrames
+      };
+    });
   });
 }
 // 後方球速モードの自動計測: 姿勢推定でリリース候補 → ±40ms窓の差分で分離検出（クラス判定） → 捕球音オンセットで到達 → 球速計算
@@ -5680,54 +5889,45 @@ function runRearAuto(){
   v.pause();
   var savedPos=v.currentTime;
   var center=(state.releaseTime!=null) ? state.releaseTime : v.duration/2;
-  var preSec=Math.max(0.5, Math.min(10, Number(poseEls?poseEls.pre.value:0)||POSE_PRE_SEC));
-  var postSec=Math.max(0.5, Math.min(10, Number(poseEls?poseEls.post.value:0)||POSE_POST_SEC));
-  var t0=(state.releaseTime!=null) ? Math.max(0, center-preSec) : 0;   // リリースマーク未設定なら動画全体を走査
-  var t1=(state.releaseTime!=null) ? Math.min(v.duration, center+postSec) : v.duration;
+  // リリースマーク未設定なら動画全体を走査するため、窓が全体をカバーするように pre/post を決める
+  var preSec=(state.releaseTime!=null) ? Math.max(0.5, Math.min(10, Number(poseEls?poseEls.pre.value:0)||POSE_PRE_SEC)) : v.duration/2+1;
+  var postSec=(state.releaseTime!=null) ? Math.max(0.5, Math.min(10, Number(poseEls?poseEls.post.value:0)||POSE_POST_SEC)) : v.duration/2+1;
   setRearModeProgress(2, '姿勢推定でリリース候補を生成中…（CDNからモデル読み込み）');
-  return poseEstimateWindow(v, t0, t1, function(pct, msg){ setRearModeProgress(2+Math.round(pct*50), msg); }).then(function(poseFrames){
-    if(!poseFrames || !poseFrames.length) throw new Error('姿勢ランドマークを取得できませんでした');
-    var rc=KYU.poseDetectReleaseCandidate(poseFrames, {hand:state.poseHand, direction:1});
-    if(!rc || rc.t==null) throw new Error('リリース候補を検出できませんでした');
-    setRearModeProgress(55, 'リリース候補 F'+pad(frameNoOf(rc.t),4)+'（'+rc.t.toFixed(3)+'s）の前後±'+KYU.REAR_SEP_WIN_MS+'msを画像差分で精密化中…');
-    var wrist=scanWristAt(poseFrames, rc.t);
-    return rearRefineRelease(rc.t, wrist?wrist.x:SCAN_W/2, wrist?wrist.y:SCAN_H/2, poseFrames).then(function(ref){
-      setRearModeProgress(75, '捕球音から到達候補を検出中…（一括解析と同じ音声オンセット検出）');
-      var peaksP=(detailBlob ? scanAudioPeaks(detailBlob) : Promise.resolve(null));
-      return peaksP.then(function(peaks){
-        var arr=null;
-        if(peaks && peaks.length){
-          var hit=KYU.firstAudioOnsetAfter(peaks.map(function(p){ return p.sec; }), ref.releaseT, state.camDistM);
-          if(hit) arr=hit.sec;
-        }
-        state.releaseTime=ref.releaseT;
-        if(arr!=null) state.arrivalTime=arr;
-        state.rearResult={
-          relClass:ref.relClass, releaseT:ref.releaseT, candidateT:ref.candidateT,
-          sepFound:ref.sepFound, sepIndex:ref.sepAbsIndex!=null?ref.sepAbsIndex:ref.sepIndex,
-          arrivalT:(arr!=null?arr:null), arrivalSource:(arr!=null?'audio-onset':'manual'), confirmed:false
-        };
-        // v0.15: プレート通過位置を計測（rear専用。校正済みの場合のみ有効・未校正/検出失敗時は位置なしで球速のみ）
-        return measureRearPlatePass({releaseT:ref.releaseT, arrivalT:(arr!=null?arr:state.arrivalTime)}).then(function(plate){
-          renderCalibMarkers(); // 通過フレームのボール検出マーカーを動画上に描画
-          updateMarks(); updateResult(); renderRearModeResult(); updateRearModeUI();
-          setRearModeProgress(100, '完了');
-          var plateMsg='';
-          if(plate && plate.found){
-            plateMsg=' プレート通過位置: 左右'+(plate.xCm>=0?'+':'')+plate.xCm.toFixed(1)+'cm・高さ'+plate.hCm.toFixed(1)+'cm（通過推定 F'+pad(frameNoOf(plate.passT),4)+'）';
-          }else if(plate && plate.reason==='uncalibrated'){
-            plateMsg=' プレート通過位置: 未校正のため計測していません（後方校正を実施してください。球速は計測済み）';
-          }else if(plate){
-            plateMsg=' プレート通過位置: 検出できませんでした（球速のみ）';
-          }
-          if(arr==null){
-            setRearModeStatus('音声から捕球音オンセットを検出できませんでした。到達点は「到達点をマーク」ボタンで手動設定してください（手動マークにフォールバック）。リリース時刻はクラス'+ref.relClass+'で確定しています'+plateMsg);
-          }else{
-            setRearModeStatus('到達候補: 捕球音オンセット '+arr.toFixed(3)+'s（音速遅延補正 -'+Math.round(KYU.soundDelaySec(state.camDistM)*1000)+'ms適用）。信頼性クラス '+ref.relClass+' でリリース='+ref.releaseT.toFixed(3)+'s に確定しました'+plateMsg);
-          }
-          return state.rearResult;
-        });
-      });
+  var peaksP=(detailBlob ? scanAudioPeaks(detailBlob) : Promise.resolve(null));
+  return peaksP.then(function(peaks){
+    var peakSecs=(peaks && peaks.length) ? peaks.map(function(p){ return p.sec; }) : null;
+    // v0.16: 1投球の後方精密化パスは rearRefineOne に共通化（一括解析の後方精密化と同じ関数）
+    return rearRefineOne(v, center, preSec, postSec, peakSecs, {
+      onProgress:function(pct, msg){ setRearModeProgress(2+Math.round(pct*73), msg); }
+    });
+  }).then(function(ref){
+    var arr=ref.arrivalT;
+    state.releaseTime=ref.releaseT;
+    if(arr!=null) state.arrivalTime=arr;
+    state.rearResult={
+      relClass:ref.relClass, releaseT:ref.releaseT, candidateT:ref.candidateT,
+      sepFound:ref.sepFound, sepIndex:ref.sepIndex,
+      arrivalT:arr, arrivalSource:ref.arrivalSource, confirmed:false
+    };
+    // v0.15: プレート通過位置を計測（rear専用。校正済みの場合のみ有効・未校正/検出失敗時は位置なしで球速のみ）
+    return measureRearPlatePass({releaseT:ref.releaseT, arrivalT:(arr!=null?arr:state.arrivalTime)}).then(function(plate){
+      renderCalibMarkers(); // 通過フレームのボール検出マーカーを動画上に描画
+      updateMarks(); updateResult(); renderRearModeResult(); updateRearModeUI();
+      setRearModeProgress(100, '完了');
+      var plateMsg='';
+      if(plate && plate.found){
+        plateMsg=' プレート通過位置: 左右'+(plate.xCm>=0?'+':'')+plate.xCm.toFixed(1)+'cm・高さ'+plate.hCm.toFixed(1)+'cm（通過推定 F'+pad(frameNoOf(plate.passT),4)+'）';
+      }else if(plate && plate.reason==='uncalibrated'){
+        plateMsg=' プレート通過位置: 未校正のため計測していません（後方校正を実施してください。球速は計測済み）';
+      }else if(plate){
+        plateMsg=' プレート通過位置: 検出できませんでした（球速のみ）';
+      }
+      if(arr==null){
+        setRearModeStatus('音声から捕球音オンセットを検出できませんでした。到達点は「到達点をマーク」ボタンで手動設定してください（手動マークにフォールバック）。リリース時刻はクラス'+ref.relClass+'で確定しています'+plateMsg);
+      }else{
+        setRearModeStatus('到達候補: 捕球音オンセット '+arr.toFixed(3)+'s（音速遅延補正 -'+Math.round(KYU.soundDelaySec(state.camDistM)*1000)+'ms適用）。信頼性クラス '+ref.relClass+' でリリース='+ref.releaseT.toFixed(3)+'s に確定しました'+plateMsg);
+      }
+      return state.rearResult;
     });
   }).catch(function(e){
     setRearModeProgress(100, '解析失敗');
@@ -5860,6 +6060,9 @@ if(typeof module!=='undefined' && module.exports){
     buildRearModeUI:buildRearModeUI, updateRearModeUI:updateRearModeUI,
     runRearAuto:runRearAuto, rearRefineRelease:rearRefineRelease, renderRearModeResult:renderRearModeResult,
     confirmRearResult:confirmRearResult, scanWristAt:scanWristAt, poseEstimateWindow:poseEstimateWindow,
+    poseCreateLandmarker:poseCreateLandmarker, poseEstimateWindowWith:poseEstimateWindowWith,
+    rearRefineOne:rearRefineOne, computeRearPlatePass:computeRearPlatePass,
+    refineBatchRowsRear:refineBatchRowsRear, BATCH_REAR_PRE_SEC:BATCH_REAR_PRE_SEC, BATCH_REAR_POST_SEC:BATCH_REAR_POST_SEC,
     rearRunning:function(){ return rearRunning; },
     rearModeEls:function(){ return rearModeEls; },
     rearResultNote:rearResultNote,
