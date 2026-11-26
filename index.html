@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.17 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.18 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -988,6 +988,7 @@ var __defProp=Object.defineProperty,__export=(t,e)=>{for(var s in e)__defProp(t,
 //# sourceMappingURL=/sm/b7a578e8a3f3663d7a3b3d276b2b58a547ed893cc08c495122b6ad202935e907.map
 </script>
 <script>
+/* ==== KYU pure block (was script block 4) ==== */
 
 /* ==KYU-PURE-BEGIN==
    球速計測の純粋計算ロジック（DOM非依存。単体テスト対象） */
@@ -3059,6 +3060,56 @@ var KYU=(function(){
     return null;
   }
 
+  /* ---- v0.18 時刻の不確実性に伴う初速範囲と信頼性クラス統合（純粋関数群。2026-11-26 spec revision v0.5） ---- */
+
+  // 時刻不確実性からの初速範囲: 有効飛行距離 distM[m]・飛行時間 flightSec[s] に対し、
+  //   flightSec+uSec と flightSec-uSec の2つの飛行時間で「区間平均速度 → 初速」の既存変換
+  //   （speedKmhByTime → initialSpeedFromAvg。uSec=0 でヒーロー値 kmhInit と一致する drag モデル）
+  //   を計算し、遅い方を lo・速い方を hi として返す。flightSec-uSec が 0.05s 未満なら 0.05s にガードする。
+  //   無効入力（非数・flightSec<=0・distM<=0・uSec<0）は {lo:null, hi:null}
+  function speedRangeFromUncertainty(flightSec, uSec, distM){
+    var f=Number(flightSec), u=Number(uSec), d=Number(distM);
+    if(!isFinite(f) || !isFinite(u) || !isFinite(d) || f<=0 || d<=0 || u<0) return {lo:null, hi:null};
+    var tSlow=f+u;
+    var tFast=Math.max(0.05, f-u);
+    return {
+      lo:initialSpeedFromAvg(speedKmhByTime(d, tSlow), d),
+      hi:initialSpeedFromAvg(speedKmhByTime(d, tFast), d)
+    };
+  }
+
+  // リリース時刻ブラケット幅(ms)からのリリースクラス: ≤8.33ms=A（240fpsの2フレーム相当）、
+  //   ≤25ms=B（120fpsの3フレーム相当）、それ以上=C
+  function releaseClassFromBracket(bracketMs){
+    var b=Number(bracketMs);
+    if(!isFinite(b)) return 'C'; // 非数は C 扱い（0 以下も仕様どおり <=8.33 で A）
+    if(b<=8.33) return 'A';
+    if(b<=25) return 'B';
+    return 'C';
+  }
+
+  // 信頼性クラスの統合: releaseClass と detectionClass の低い方（A=3,B=2,C=1 として min）を返す。
+  //   distanceSource==='assumed'（公式距離を仮定）の場合は結果を 'B' にキャップする（'A' にはならない）。
+  function combineReliabilityClass(releaseClass, detectionClass, distanceSource){
+    var rank={A:3, B:2, C:1};
+    var r1=rank[releaseClass], r2=rank[detectionClass];
+    if(r1==null) r1=1;
+    if(r2==null) r2=1;
+    var r=Math.min(r1, r2);
+    if(distanceSource==='assumed' && r>2) r=2; // 距離が仮定なら信頼性Aは出さない
+    return r===3 ? 'A' : (r===2 ? 'B' : 'C');
+  }
+
+  // 時刻の不確実性(ms) = リリースブラケット幅の半分 + 到達側の追加誤差。
+  //   arrivalKind==='audio'（捕球音オンセット由来）なら +5ms、それ以外（手動マーク）なら
+  //   +1フレーム間隔[ms]（frameIntervalMs は ms 単位のフレーム間隔）
+  function timeUncertaintyMs(bracketMs, arrivalKind, frameIntervalMs){
+    var b=Number(bracketMs), f=Number(frameIntervalMs);
+    if(!isFinite(b) || b<0) b=0;
+    if(!isFinite(f) || f<0) f=0;
+    return b/2 + (arrivalKind==='audio' ? 5 : f);
+  }
+
   return {
     SAMPLE_MS:SAMPLE_MS, TRIG_MIN:TRIG_MIN, TRIG_RATIO:TRIG_RATIO, TRIG_STREAK:TRIG_STREAK,
     QUIET_ABS:QUIET_ABS, QUIET_RATIO:QUIET_RATIO, QUIET_MS:QUIET_MS, MAX_REC_MS:MAX_REC_MS, ARM_MS:ARM_MS,
@@ -3090,6 +3141,8 @@ var KYU=(function(){
     REAR_SEP_THR:REAR_SEP_THR, REAR_SEP_MIN_PX:REAR_SEP_MIN_PX, REAR_SEP_DIST:REAR_SEP_DIST, REAR_SEP_WEAK_MIN_PX:REAR_SEP_WEAK_MIN_PX,
     rearPlatePxPerMeter:rearPlatePxPerMeter, detectSeparation:detectSeparation,
     classifyRelease:classifyRelease, firstAudioOnsetAfter:firstAudioOnsetAfter,
+    speedRangeFromUncertainty:speedRangeFromUncertainty, releaseClassFromBracket:releaseClassFromBracket,
+    combineReliabilityClass:combineReliabilityClass, timeUncertaintyMs:timeUncertaintyMs,
     MITT_BEHIND_M_DEFAULT:MITT_BEHIND_M_DEFAULT, ZONE_LOW_CM:ZONE_LOW_CM, ZONE_HIGH_CM:ZONE_HIGH_CM,
     PLATE_ROI_W_MULT:PLATE_ROI_W_MULT, PLATE_ROI_H_M:PLATE_ROI_H_M, PLATE_ROI_DOWN_M:PLATE_ROI_DOWN_M, PLATE_MIN_PX:PLATE_MIN_PX,
     platePassTime:platePassTime, platePositionFromPx:platePositionFromPx, centroidInRoi:centroidInRoi,
@@ -3102,11 +3155,10 @@ var KYU=(function(){
 })();
 if(typeof module!=='undefined' && module.exports){ module.exports=KYU; }
 /* ==KYU-PURE-END== */
-
-
 </script>
 
 <script>
+/* ==== Main app block (was script block 5) ==== */
 
 (function(){
 'use strict';
@@ -3144,7 +3196,8 @@ var els={
 };
 
 var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null, voiceOn:true, calib:{active:false, points:[], source:null, advanceM:null, pxPerM:null}, lastIvb:null, poseHand:'right', poseResult:null, shootMode:'side',
-  rearCalib:{active:false, points:[], pxPerM:null, template:null, mittBehindM:KYU.MITT_BEHIND_M_DEFAULT, zoneLowCm:KYU.ZONE_LOW_CM, zoneHighCm:KYU.ZONE_HIGH_CM}, rearResult:null }; // §13 v0.4: 後方校正（動画ごとに保持・リセット）と後方球速モードの結果。v0.15: 捕球点後方距離・ゾーン高さ設定も動画ごとに保持。v0.17: template=校正時のずれ検知用テンプレート
+  rearCalib:{active:false, points:[], pxPerM:null, template:null, mittBehindM:KYU.MITT_BEHIND_M_DEFAULT, zoneLowCm:KYU.ZONE_LOW_CM, zoneHighCm:KYU.ZONE_HIGH_CM}, rearResult:null,
+  distanceSource:'assumed' }; // §13 v0.4: 後方校正（動画ごとに保持・リセット）と後方球速モードの結果。v0.15: 捕球点後方距離・ゾーン高さ設定も動画ごとに保持。v0.17: template=校正時のずれ検知用テンプレート。v0.18: distanceSource='assumed'|'measured'（距離の扱い。信頼性クラスのキャップに使用。quick設定として永続化）
 var q={ stream:null, starting:false, monitor:null, prev:null, gate:KYU.newGate(),
       mode:'off', mediaRec:null, chunks:[], mime:'', recStartAt:0, blob:null, recId:null, arrivalSource:'', analyzeUrl:null };
 var objectUrl=null;
@@ -3176,7 +3229,7 @@ function loadAll(){ try{ var d=JSON.parse(localStorage.getItem(LS_KEY)); return 
 function saveAll(d){ try{ localStorage.setItem(LS_KEY, JSON.stringify(d)); }catch(e){ toast('保存に失敗しました（容量不足の可能性があります）'); } }
 function loadQuickSettings(){ try{ var d=JSON.parse(localStorage.getItem(QLS_KEY)); return (d&&typeof d==='object')?d:{}; }catch(e){ return {}; } }
 function saveQuickSettings(){
-  try{ localStorage.setItem(QLS_KEY, JSON.stringify({dist:state.distPreset, custom:state.customDist, corr:state.correction, name:els.qPlayerName.value, height:state.heightCm, camDist:state.camDistM, voice:state.voiceOn, poseHand:state.poseHand, shootMode:state.shootMode})); }catch(e){}
+  try{ localStorage.setItem(QLS_KEY, JSON.stringify({dist:state.distPreset, custom:state.customDist, corr:state.correction, name:els.qPlayerName.value, height:state.heightCm, camDist:state.camDistM, voice:state.voiceOn, poseHand:state.poseHand, shootMode:state.shootMode, distSource:state.distanceSource})); }catch(e){} // v0.18: distSource（距離の扱い）も永続化
 }
 
 function toast(msg){
@@ -3648,8 +3701,24 @@ function resultPanelHTML(r, excludeId){
   // 終速（推定）タイルと減衰率タイル（初速×e^(−kD) とその減衰率%）
   var plateKmh=(typeof r.plateKmh==='number' && isFinite(r.plateKmh)) ? r.plateKmh : null;
   var decayPct=(typeof r.decayPct==='number' && isFinite(r.decayPct)) ? r.decayPct : null;
+  // v0.18: 動画の実効fpsが 120 未満ならヒーロー球速は整数（四捨五入）、120以上なら従来どおり1桁小数
+  var lowFps=effectiveFps()<120;
+  var heroTxt=lowFps ? String(Math.round(heroKmh)) : heroKmh.toFixed(1);
+  // v0.18: 時刻の不確実性による推定範囲（rear詳細結果の speedLo/speedHi。r に無ければ state.rearResult から取る）
+  //   幅が 1 km/h 以上のときだけヒーローの下に小さく表示。lo=切り捨て・hi=切り上げ（外向き丸め）で表示する
+  var rr18=(isRear() && state.rearResult) ? state.rearResult : null;
+  var sLo=(typeof r.speedLo==='number' && isFinite(r.speedLo)) ? r.speedLo
+        : (rr18 && typeof rr18.speedLo==='number' && isFinite(rr18.speedLo)) ? rr18.speedLo : null;
+  var sHi=(typeof r.speedHi==='number' && isFinite(r.speedHi)) ? r.speedHi
+        : (rr18 && typeof rr18.speedHi==='number' && isFinite(rr18.speedHi)) ? rr18.speedHi : null;
+  var rangeHtml='';
+  if(sLo!=null && sHi!=null && (sHi-sLo)>=1){
+    var loTxt=lowFps ? String(Math.floor(sLo)) : (Math.floor(sLo*10+1e-9)/10).toFixed(1);
+    var hiTxt=lowFps ? String(Math.ceil(sHi)) : (Math.ceil(sHi*10-1e-9)/10).toFixed(1);
+    rangeHtml='<div class="hero-range small">推定範囲（時刻の不確実性）: '+loTxt+'–'+hiTxt+' km/h</div>';
+  }
   return '<div class="rpanel">'+
-    '<div class="hero-tile"><div class="t-label">推定初速</div><div class="hero-val">'+heroKmh.toFixed(1)+'</div><div class="hero-unit">km/h</div></div>'+
+    '<div class="hero-tile"><div class="t-label">推定初速</div><div class="hero-val">'+heroTxt+'</div><div class="hero-unit">km/h</div>'+rangeHtml+'</div>'+
     '<div class="tiles">'+
       tile('推定精度', '±'+r.accPct.toFixed(1)+'%', '±'+(heroKmh*r.accPct/100).toFixed(1)+' km/h')+
       tile('経過フレーム', r.frames+' F', 'F'+pad(r.releaseFrame,4)+' → F'+pad(r.arrivalFrame,4))+
@@ -3701,6 +3770,8 @@ function nudge(which, delta){
   }else{
     if(state.arrivalTime==null) return;
     state.arrivalTime=shiftByFrames(state.arrivalTime, delta);
+    // v0.18: 到達の手動微調整も arrivalKind='manual' として反映（rear時のみ）
+    if(isRear() && state.rearResult) applyRearReliability(state.rearResult, {arrivalManual:true, arrivalT:state.arrivalTime});
   }
   updateMarks(); updateResult(); renderQuickResult();
   autoSaveQuick(true); // 保存済み記録を即座に更新（球速の再計算結果で上書き）
@@ -4544,6 +4615,8 @@ els.markRelease.addEventListener('click', function(){
 els.markArrival.addEventListener('click', function(){
   if(!state.loaded) return;
   state.arrivalTime=els.video.currentTime;
+  // v0.18: 到達を手動で確定・調整したら arrivalKind='manual' として信頼性フィールドを再計算（rear時のみ）
+  if(isRear() && state.rearResult) applyRearReliability(state.rearResult, {arrivalManual:true, arrivalT:state.arrivalTime});
   updateMarks(); updateResult();
 });
 function updateMarks(){
@@ -4597,13 +4670,21 @@ function computeResult(){
 function rearResultNote(){
   if(!isRear() || !state.rearResult) return '';
   var rr=state.rearResult;
-  var clsTxt= rr.relClass==='A' ? 'A（分離を画像で確認・自動採用）'
+  var detTxt= rr.relClass==='A' ? 'A（分離を画像で確認・自動採用）'
             : rr.relClass==='B' ? 'B（分離を外挿で推定）'
             : 'C（姿勢候補のみ・手動確認が必要）';
+  // v0.18: 表示する信頼性クラスは統合後の reliabilityClass（無ければ検出クラス relClass のまま）
+  var clsTxt=(rr.reliabilityClass!=null && rr.reliabilityClass!==rr.relClass)
+    ? rr.reliabilityClass+'（検出クラス '+detTxt+' ・ 距離:'+(rr.distanceSource==='measured'?'実測':'仮定')+'）'
+    : detTxt;
   return '<div class="small" style="margin-top:6px">後方球速モード 内訳: 信頼性クラス <b>'+clsTxt+'</b>'+
     ' ・ リリース候補時刻 '+(rr.candidateT!=null?rr.candidateT.toFixed(3)+'s':'—')+
     ' ・ 分離フレーム '+(rr.sepFound?'あり（精密化後 F'+pad(frameNoOf(rr.releaseT),4)+'）':'なし')+
     ' ・ 到達 '+(rr.arrivalSource==='audio-onset'?'捕球音オンセット（音速遅延補正済み）':'手動マークにフォールバック')+
+    // v0.18: ブラケット幅と時刻不確実性（あれば）
+    (rr.uncertaintyMs!=null
+      ? ' ・ 時刻不確実性 ±'+rr.uncertaintyMs.toFixed(1)+'ms（リリースブラケット '+rr.bracketMs.toFixed(1)+'ms ・ 到達 '+(rr.arrivalKind==='audio'?'捕球音':'手動')+'）'
+      : '')+
     (rr.relClass==='C' && !rr.confirmed ? ' ・ <span class="err">クラスCのため「この時刻で確定」を押すまで保存できません</span>' : '')+
     // v0.17: 校正ずれ検知の警告（注意/再校正推奨）を結果パネルにも明示
     (rr.driftCm!=null
@@ -4679,6 +4760,19 @@ function makeRecord(r, o){
     var relClass=(o.relClass!=null) ? o.relClass
       : (state.rearResult && state.rearResult.relClass!=null ? state.rearResult.relClass : null);
     if(relClass!=null) rec.relClass=relClass;
+    // v0.18: 詳細ビュー（source='detail'）のときだけ、検出クラスを detectionClass として保持し、
+    //   ブラケット幅・時刻不確実性・推定範囲・距離ソース・リリースクラス・統合後の信頼性クラスも記録へ格納する
+    //   （一括解析のバッチ行が既に持つ relClass 等の形は変えない＝新フィールドは詳細ビューのみ）
+    if((o.source==='detail' || !o.source) && state.rearResult && relClass!=null){
+      var rr18=state.rearResult;
+      rec.detectionClass=relClass;
+      var f18=(rr18.reliabilityClass!=null) ? rr18
+        : applyRearReliability({relClass:relClass, arrivalSource:rr18.arrivalSource, arrivalKind:rr18.arrivalKind,
+                                releaseT:rr18.releaseT, arrivalT:rr18.arrivalT}, {});
+      ['bracketMs','uncertaintyMs','speedLo','speedHi','distanceSource','releaseClass','reliabilityClass'].forEach(function(k){
+        if(f18[k]!=null) rec[k]=f18[k];
+      });
+    }
     var rp=(o.rearPxPerMeter!=null) ? o.rearPxPerMeter : rearCalibPxPerM();
     if(rp!=null) rec.rearPxPerMeter=rp;
     // v0.15: 捕球点の後方距離を記録へ含める（設定値。後方校正データと同じく動画ごとに保持）
@@ -5162,17 +5256,34 @@ function buildRearCalibUI(){
       '<label class="small">捕球点の後方距離 <input id="rearMittBehindM" type="number" min="0" max="5" step="0.1" style="width:4.5em"> m</label>'+
       '<label class="small">ゾーン下限 <input id="rearZoneLowCm" type="number" min="0" max="200" step="1" style="width:4em"> cm</label>'+
       '<label class="small">ゾーン上限 <input id="rearZoneHighCm" type="number" min="0" max="200" step="1" style="width:4em"> cm</label>'+
+      // v0.18: 距離の扱い（distanceSource）。後方設定エリアはこの JS生成カード（buildRearCalibUI）なので、
+      //   HTML を編集せずここでセレクトを追加する（既存の mittBehindM 等の設定入力と同じパターン）。
+      //   永続化は HTML 静的ではなく既存の quick 設定（QLS_KEY の localStorage）で行う（shootMode/poseHand と同じ方式）。
+      '<label class="small">距離の扱い <select id="rearDistSourceSel">'+
+        '<option value="assumed">公式距離とみなす（既定）</option>'+
+        '<option value="measured">実測の有効飛行距離</option>'+
+      '</select></label>'+
     '</div>'+
-    '<p class="muted small" style="margin-top:4px">プレート通過位置は後方校正済みの場合のみ有効です（未校正なら校正を促す表示になります。球速は校正なしで計測できます）。通過時刻 = 到達時刻 − 捕球点の後方距離 ÷ プレート通過速度（終速推定 plateKmh）。左右 = プレート中心からのcm（画像右が＋）、高さ = プレート面から上向きのcm。px/m は rearPxPerMeter を縦横同一とみなす一次近似です。これらの設定は動画ごとに保持され、読み替えると既定値（0.8m・45〜110cm）に戻ります。</p>';
+    '<p class="muted small" style="margin-top:4px">プレート通過位置は後方校正済みの場合のみ有効です（未校正なら校正を促す表示になります。球速は校正なしで計測できます）。通過時刻 = 到達時刻 − 捕球点の後方距離 ÷ プレート通過速度（終速推定 plateKmh）。左右 = プレート中心からのcm（画像右が＋）、高さ = プレート面から上向きのcm。px/m は rearPxPerMeter を縦横同一とみなす一次近似です。これらの設定は動画ごとに保持され、読み替えると既定値（0.8m・45〜110cm）に戻ります。</p>'+
+    // v0.18: 距離定義の注記（後方設定エリアへJS注入。HTMLは無変更）
+    '<p class="muted small" id="rearDistNote" style="margin-top:4px">距離は投手板前縁〜本塁後端頂点（公式18.44m）。実際の有効飛行距離はリリース位置と捕球位置で変わります。</p>';
   var anchor=(calibEls && calibEls.card) || els.video.closest('.card'); // タップ校正カードの直後に挿入
   (anchor && anchor.parentNode ? anchor.parentNode : els.detailView).insertBefore(card, anchor ? anchor.nextSibling : null);
   rearCalibEls={
     card:card, start:$('rearCalibStartBtn'), cancel:$('rearCalibCancelBtn'),
     status:$('rearCalibStatus'), result:$('rearCalibResult'),
-    mitt:$('rearMittBehindM'), zoneLow:$('rearZoneLowCm'), zoneHigh:$('rearZoneHighCm')
+    mitt:$('rearMittBehindM'), zoneLow:$('rearZoneLowCm'), zoneHigh:$('rearZoneHighCm'),
+    distSource:$('rearDistSourceSel') // v0.18: 距離の扱いセレクト（JS生成カード内なのでHTML無変更で追加できる）
   };
   rearCalibEls.start.addEventListener('click', function(){ startRearCalibration(); });
   rearCalibEls.cancel.addEventListener('click', function(){ cancelRearCalibration(); });
+  // v0.18: 距離の扱い（distanceSource）の変更は state と quick 設定（localStorage）へ保存し、結果表示へ即時反映
+  rearCalibEls.distSource.addEventListener('change', function(){
+    state.distanceSource=(rearCalibEls.distSource.value==='measured') ? 'measured' : 'assumed';
+    saveQuickSettings();
+    if(isRear() && state.rearResult) applyRearReliability(state.rearResult, {}); // 表示クラス・範囲を再計算
+    updateRearCalibUI(); updateResult(); renderRearModeResult();
+  });
   // v0.15: 設定入力（動画ごとに保持。永続化は既存の校正と同じ扱い＝localStorageには載せず動画ごとにリセット）
   function onRearSettingInput(){
     var c=state.rearCalib;
@@ -5215,6 +5326,54 @@ function rearPlateSettings(){
   var low=(typeof c.zoneLowCm==='number' && isFinite(c.zoneLowCm) && c.zoneLowCm>=0) ? c.zoneLowCm : KYU.ZONE_LOW_CM;
   var high=(typeof c.zoneHighCm==='number' && isFinite(c.zoneHighCm) && c.zoneHighCm>low) ? c.zoneHighCm : KYU.ZONE_HIGH_CM;
   return {mittBehindM:mitt, zoneLowCm:low, zoneHighCm:high};
+}
+
+/* ---- v0.18 後方詳細結果の信頼性フィールド（2026-11-26 spec revision v0.5） ----
+   リリースのブラケット幅 bracketMs は検出パスで決まる: 分離が画像で確認できた(A)=1フレーム間隔、
+   外挿で推定(B)=2フレーム間隔、姿勢候補のみ(C)=80ms固定。arrivalKind は到達が捕球音オンセット由来なら
+   'audio'、ユーザーが手動で確定・調整したら 'manual'。uncertaintyMs は KYU.timeUncertaintyMs、
+   speedLo/speedHi は KYU.speedRangeFromUncertainty（飛行時間=到達−リリース、有効距離=effectiveDistance）で
+   初速範囲を算出する。releaseClass は KYU.releaseClassFromBracket、表示用の最終クラス reliabilityClass は
+   KYU.combineReliabilityClass(releaseClass, 検出クラス relClass, distanceSource) で決まる
+   （距離が 'assumed' なら A にはならず B にキャップ）。これらを state.rearResult と記録へ格納する。 */
+// 動画の実効fps（MP4フレーム時刻列があればその実効値、なければ選択中のfps）
+function effectiveFps(){ return KYU.fpsFromFrameTimes(state.frameTimes)||state.fps; }
+// リリースブラケット幅(ms): A=1フレーム間隔, B=2フレーム間隔, C=80ms固定
+function rearBracketMs(relClass){
+  var frameMs=1000/effectiveFps();
+  if(relClass==='A') return frameMs;
+  if(relClass==='B') return 2*frameMs;
+  return 80;
+}
+// 後方結果 rr に v0.18 の信頼性フィールド一式を算出して付与する（rr を返す。state には触らない）
+// o: {arrivalT, arrivalManual}（arrivalManual=true なら arrivalKind を強制的に 'manual'＝ユーザーが手動調整）
+function applyRearReliability(rr, o){
+  o=o||{};
+  if(!rr) return rr;
+  var fpsEff=effectiveFps();
+  var frameMs=1000/fpsEff;
+  var bracketMs=rearBracketMs(rr.relClass);
+  var arrivalKind=rr.arrivalKind;
+  if(arrivalKind!=='manual' && arrivalKind!=='audio'){
+    arrivalKind=(rr.arrivalSource==='audio-onset') ? 'audio' : 'manual';
+  }
+  if(o.arrivalManual) arrivalKind='manual';
+  var uncertaintyMs=KYU.timeUncertaintyMs(bracketMs, arrivalKind, frameMs);
+  var releaseClass=KYU.releaseClassFromBracket(bracketMs);
+  var distanceSource=(state.distanceSource==='measured') ? 'measured' : 'assumed';
+  var reliabilityClass=KYU.combineReliabilityClass(releaseClass, rr.relClass, distanceSource);
+  var releaseT=(rr.releaseT!=null) ? rr.releaseT : state.releaseTime;
+  var arrivalT=(o.arrivalT!=null) ? o.arrivalT : ((rr.arrivalT!=null) ? rr.arrivalT : state.arrivalTime);
+  var speedLo=null, speedHi=null;
+  var eff=effectiveDistance();
+  if(releaseT!=null && arrivalT!=null && (arrivalT-releaseT)>0 && eff!=null && eff>0){
+    var rg=KYU.speedRangeFromUncertainty(arrivalT-releaseT, uncertaintyMs/1000, eff);
+    speedLo=rg.lo; speedHi=rg.hi;
+  }
+  rr.bracketMs=bracketMs; rr.arrivalKind=arrivalKind; rr.uncertaintyMs=uncertaintyMs;
+  rr.speedLo=speedLo; rr.speedHi=speedHi; rr.distanceSource=distanceSource;
+  rr.releaseClass=releaseClass; rr.reliabilityClass=reliabilityClass;
+  return rr;
 }
 /* ---- v0.17 後方校正のずれ検知（カメラ移動・校正ずれ検知） ----
    校正完了時にそのフレームのプレート周辺（左右各2倍・上下に余裕あり。KYU.driftRoiPx）を低解像度グレースケールで
@@ -5403,6 +5562,8 @@ function updateRearCalibUI(){
   if(rearCalibEls.mitt && ae!==rearCalibEls.mitt) rearCalibEls.mitt.value=String(s.mittBehindM);
   if(rearCalibEls.zoneLow && ae!==rearCalibEls.zoneLow) rearCalibEls.zoneLow.value=String(s.zoneLowCm);
   if(rearCalibEls.zoneHigh && ae!==rearCalibEls.zoneHigh) rearCalibEls.zoneHigh.value=String(s.zoneHighCm);
+  // v0.18: 距離の扱いセレクトへ現在値を反映（永続化された app 設定なので動画ごとにはリセットしない）
+  if(rearCalibEls.distSource && ae!==rearCalibEls.distSource) rearCalibEls.distSource.value=(state.distanceSource==='measured')?'measured':'assumed';
 }
 
 /* ---- Phase 3-B: ボール軌道抽出と縦変化量の実験表示（詳細モード・JS生成UI。HTMLは無変更） ----
@@ -6218,6 +6379,8 @@ function runRearAuto(o){
       sepFound:ref.sepFound, sepIndex:ref.sepIndex,
       arrivalT:arr, arrivalSource:ref.arrivalSource, confirmed:false
     };
+    // v0.18: 信頼性フィールド（bracketMs/arrivalKind/uncertaintyMs/speedLo/speedHi/distanceSource/releaseClass/reliabilityClass）を算出して付与
+    applyRearReliability(state.rearResult, {arrivalT:(arr!=null?arr:state.arrivalTime)});
     // v0.15: プレート通過位置を計測（rear専用。校正済みの場合のみ有効・未校正/検出失敗時は位置なしで球速のみ）
     return Promise.all([
       measureRearPlatePass({releaseT:ref.releaseT, arrivalT:(arr!=null?arr:state.arrivalTime)}),
@@ -6302,9 +6465,20 @@ function renderRearModeResult(){
   var kmhTxt = (r.status==='ok')
     ? ('推定初速 '+(r.kmhInit!=null?r.kmhInit:r.kmh).toFixed(1)+' km/h（区間平均 '+r.kmh.toFixed(1)+' km/h ・ '+r.frames+'F / '+r.timeSec.toFixed(3)+'s）')
     : '球速はリリース/到達マークが揃ってから計算されます';
-  var clsTxt= rr.relClass==='A' ? 'A（分離を画像で確認・自動採用）'
+  var detTxt= rr.relClass==='A' ? 'A（分離を画像で確認・自動採用）'
             : rr.relClass==='B' ? 'B（分離を外挿で推定）'
             : 'C（姿勢候補のみ・手動確認が必要）'+(rr.confirmed?'・確定済み':'');
+  // v0.18: 表示する信頼性クラスは統合後の reliabilityClass（無ければ検出クラスのまま）
+  var clsTxt=(rr.reliabilityClass!=null && rr.reliabilityClass!==rr.relClass)
+    ? rr.reliabilityClass+'（検出クラス '+detTxt+' ・ 距離:'+(rr.distanceSource==='measured'?'実測':'仮定')+'）'
+    : detTxt;
+  // v0.18: ブラケット幅・時刻不確実性・推定範囲（フィールドがあるときだけ行を追加）
+  var uncRow=(rr.uncertaintyMs!=null)
+    ? '<div class="rec-top"><span class="rec-name">時刻の不確実性</span><span class="rec-kmh">±'+rr.uncertaintyMs.toFixed(1)+'ms（リリースブラケット '+rr.bracketMs.toFixed(1)+'ms ・ 到達 '+(rr.arrivalKind==='audio'?'捕球音':'手動')+' ・ 距離:'+(rr.distanceSource==='measured'?'実測':'仮定')+'）</span></div>'
+    : '';
+  var rangeRow=(typeof rr.speedLo==='number' && isFinite(rr.speedLo) && typeof rr.speedHi==='number' && isFinite(rr.speedHi))
+    ? '<div class="rec-top"><span class="rec-name">推定範囲（時刻の不確実性）</span><span class="rec-kmh">'+rr.speedLo.toFixed(1)+'–'+rr.speedHi.toFixed(1)+' km/h</span></div>'
+    : '';
   rearModeEls.result.innerHTML=
     '<div class="rec-top"><span class="rec-name">信頼性クラス</span><span class="rec-kmh">'+clsTxt+'</span></div>'+
     '<div class="rec-top"><span class="rec-name">リリース候補時刻（姿勢推定）</span><span class="rec-kmh">'+(rr.candidateT!=null?rr.candidateT.toFixed(3)+'s':'—')+'</span></div>'+
@@ -6313,6 +6487,7 @@ function renderRearModeResult(){
     '<div class="rec-top"><span class="rec-name">到達候補</span><span class="rec-kmh">'+(rr.arrivalSource==='audio-onset'
       ? '捕球音オンセット '+(rr.arrivalT!=null?rr.arrivalT.toFixed(3)+'s':'')+'（音速遅延補正済み）'
       : '手動マークにフォールバック（音声から捕球音を検出できませんでした）')+'</span></div>'+
+    uncRow+rangeRow+
     '<div class="rec-top"><span class="rec-name">球速</span><span class="rec-kmh">'+kmhTxt+'</span></div>'+
     // v0.15: プレート通過位置（rear専用。校正済み＋検出成功時のみ値あり）
     '<div class="rec-top"><span class="rec-name">プレート通過位置</span><span class="rec-kmh">'+plateLineText(rr)+'</span></div>';
@@ -6333,6 +6508,7 @@ function renderRearModeResult(){
   if(typeof qs.voice==='boolean') state.voiceOn=qs.voice; // 音声読み上げON/OFF（既定ON）
   if(typeof qs.poseHand==='string' && (qs.poseHand==='left' || qs.poseHand==='right')) state.poseHand=qs.poseHand; // Phase 2: 利き腕（既定 右投げ）
   if(qs.shootMode==='rear') state.shootMode='rear'; // §13 v0.13: 撮影モード（既定 side＝現行どおり）
+  if(qs.distSource==='assumed' || qs.distSource==='measured') state.distanceSource=qs.distSource; // v0.18: 距離の扱い（既定 assumed＝公式距離とみなす）
   syncDistUI();
   setControlsEnabled(false);
   updateFrameUI(); updateMarks(); updateResult();
@@ -6387,6 +6563,7 @@ if(typeof module!=='undefined' && module.exports){
     rearCalibEls:function(){ return rearCalibEls; },
     buildRearModeUI:buildRearModeUI, updateRearModeUI:updateRearModeUI,
     runRearAuto:runRearAuto, rearRefineRelease:rearRefineRelease, renderRearModeResult:renderRearModeResult,
+    applyRearReliability:applyRearReliability, rearBracketMs:rearBracketMs, effectiveFps:effectiveFps, // v0.18
     confirmRearResult:confirmRearResult, scanWristAt:scanWristAt, poseEstimateWindow:poseEstimateWindow,
     poseCreateLandmarker:poseCreateLandmarker, poseEstimateWindowWith:poseEstimateWindowWith,
     rearRefineOne:rearRefineOne, computeRearPlatePass:computeRearPlatePass,
