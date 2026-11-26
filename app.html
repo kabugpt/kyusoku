@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.13 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.14 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -988,6 +988,7 @@ var __defProp=Object.defineProperty,__export=(t,e)=>{for(var s in e)__defProp(t,
 //# sourceMappingURL=/sm/b7a578e8a3f3663d7a3b3d276b2b58a547ed893cc08c495122b6ad202935e907.map
 </script>
 <script>
+
 /* ==KYU-PURE-BEGIN==
    球速計測の純粋計算ロジック（DOM非依存。単体テスト対象） */
 var KYU=(function(){
@@ -2698,6 +2699,149 @@ var KYU=(function(){
     return {toleranceFrames:TOL_FRAMES, allPass:allPass, summary:summary, details:results};
   }
 
+  /* ---- §13 v0.4 後方球速モード（Game Mode）: 純粋関数群 ----
+     後方校正（ホームベース前端の左右2タップ→プレート面px/m）、リリース精密化（候補±40ms窓の
+     手首ROIフレーム差分でボール分離フレームを検出）、信頼性クラス判定（A/B/C）、到達候補（捕球音
+     オンセットのうちリリース以降で最初・音速遅延補正つき）。すべて合成データで単体テスト可能な純粋関数。 */
+
+  var REAR_PLATE_WIDTH_M=0.432; // ホームベース幅 43.2cm（実世界既知寸法）
+  var REAR_SEP_WIN_MS=40;       // リリース候補の前後窓 ±40ms（姿勢推定の実測帯域 ±20〜30ms をカバー）
+  var REAR_SEP_HALF=10;         // 分離検出ROIの半幅（スキャン座標px。手首位置中心）
+  var REAR_SEP_THR=18;          // 分離検出のグレースケール差分しきい値（TRAJ_DIFF_THR と同水準）
+  var REAR_SEP_MIN_PX=3;        // ボール相当差分塊とみなす最小ピクセル数（正/負それぞれ）
+  var REAR_SEP_DIST=5;          // 「手から離れた」とみなす正負差分重心間の距離(px)
+  var REAR_SEP_WEAK_MIN_PX=2;   // 弱検出（クラスBの外挿根拠）の最小ピクセル数
+
+  // 後方校正: ホームベース前端の左端/右端タップ2点 {x,y} と実幅(realDistM。既定 REAR_PLATE_WIDTH_M=0.432m)から
+  // プレート面の px/m を返す純粋関数。2点がほぼ同じ・不正なら null（pxPerMeter と同じ方式）
+  function rearPlatePxPerMeter(pLeft, pRight, realDistM){
+    var d=(typeof realDistM==='number' && isFinite(realDistM) && realDistM>0) ? realDistM : REAR_PLATE_WIDTH_M;
+    return pxPerMeter(pLeft, pRight, d);
+  }
+
+  // リリース精密化の分離検出（純粋関数。合成フレームでテスト可能）
+  // frames: [{gray: グレースケール配列, width, height}] 時刻順のフレーム列（窓内のもの）
+  // opts: {cx, cy（手首位置のROI中心）, half, thr, minPx, sepDist, baseIndex}
+  // base=frames[baseIndex]（窓の最初＝ボールが手にある状態）と各フレームのROI内差分について、
+  //   正差分重心P（ボールの新しい位置）と負差分重心N（手にあった元の位置）を強度重み付きで求め、
+  //   nPos>=minPx && nNeg>=minPx && dist(P,N)>=sepDist となる最初のフレームを分離フレームとする。
+  //   （ボールが手から離れると、元の位置に負の差分・離れた先に正の差分ができ、両重心がsepDist以上離れる）
+  // 戻り値: {found, index（frames配列内の位置）, dist, pos, neg, nPos, nNeg, series:[{index,d,nPos,nNeg}], width, height}
+  function detectSeparation(frames, opts){
+    opts=opts||{};
+    var n=frames?frames.length:0;
+    var res={found:false, index:null, dist:0, pos:null, neg:null, nPos:0, nNeg:0, series:[], width:0, height:0};
+    if(n<2) return res;
+    var baseIndex=Math.max(0, Math.min(n-1, Math.round(Number(opts.baseIndex)||0)));
+    var base=frames[baseIndex];
+    if(!base || !base.gray) return res;
+    var W=Math.floor(Number(base.width)||0), H=Math.floor(Number(base.height)||0);
+    res.width=W; res.height=H;
+    if(!(W>0)||!(H>0)||base.gray.length<W*H) return res;
+    var cx=Number(opts.cx), cy=Number(opts.cy);
+    if(!isFinite(cx)||!isFinite(cy)){ cx=W/2; cy=H/2; }
+    var half=Math.max(2, Math.floor(Number(opts.half)||REAR_SEP_HALF));
+    var thr=(typeof opts.thr==='number'&&isFinite(opts.thr)&&opts.thr>=0)?opts.thr:REAR_SEP_THR;
+    var minPx=Math.max(1, Math.round(Number(opts.minPx)||REAR_SEP_MIN_PX));
+    var sepDist=Number(opts.sepDist);
+    if(!isFinite(sepDist)||sepDist<=0) sepDist=REAR_SEP_DIST;
+    var x0=Math.max(0, Math.round(cx-half)), x1=Math.min(W-1, Math.ceil(cx+half));
+    var y0=Math.max(0, Math.round(cy-half)), y1=Math.min(H-1, Math.ceil(cy+half));
+    var b=base.gray, i, x, y;
+    for(i=baseIndex+1;i<n;i++){
+      var cur=frames[i];
+      if(!cur||!cur.gray) continue;
+      if(Math.floor(Number(cur.width)||0)!==W || Math.floor(Number(cur.height)||0)!==H) continue; // サイズ不一致はスキップ
+      var g=cur.gray;
+      if(g.length<W*H) continue;
+      var swp=0,sxp=0,syp=0,np2=0, swn=0,sxn=0,syn=0,nn=0;
+      for(y=y0;y<=y1;y++){
+        var row=y*W;
+        for(x=x0;x<=x1;x++){
+          var d=g[row+x]-b[row+x];
+          if(d>thr){ swp+=d; sxp+=d*x; syp+=d*y; np2++; }
+          else if(d<-thr){ var a=-d; swn+=a; sxn+=a*x; syn+=a*y; nn++; }
+        }
+      }
+      var rec={index:i, d:0, nPos:np2, nNeg:nn};
+      if(np2>0&&nn>0&&swp>0&&swn>0){
+        var px=sxp/swp, py=syp/swp, nx=sxn/swn, ny=syn/swn;
+        var dx=px-nx, dy=py-ny;
+        rec.d=Math.sqrt(dx*dx+dy*dy);
+        rec.pos={x:px, y:py}; rec.neg={x:nx, y:ny};
+      }
+      res.series.push(rec);
+      if(np2>=minPx && nn>=minPx && rec.d>=sepDist){
+        res.found=true; res.index=i; res.dist=rec.d; res.pos=rec.pos; res.neg=rec.neg;
+        res.nPos=np2; res.nNeg=nn;
+        return res; // ボールが手から離れる最初のフレーム
+      }
+    }
+    return res;
+  }
+
+  // 信頼性クラス判定（純粋関数）: リリース候補時刻 candidateT と detectSeparation の結果 sep、
+  // フレーム時刻列 times（frames配列に揃えたもの。無ければ candidateT基準で opts.frameDur 換算）から
+  //   A: 分離フレームが見つかった → releaseT = 分離フレームの時刻（画像で分離を確認・自動採用）
+  //   B: 分離は確定しないが弱い差分塊の距離が伸びている → 距離0への線形外挿で releaseT を推定（窓内なら採用）
+  //   C: 分離の兆候なし → releaseT = candidateT（姿勢候補のみ。ユーザーの手動確認が必要）
+  // 戻り値: {relClass:'A'|'B'|'C', releaseT, candidateT, sepFound, sepIndex, sepDist?, extrapolatedIndex?}
+  function classifyRelease(candidateT, sep, times, opts){
+    opts=opts||{};
+    var t=Number(candidateT);
+    if(!isFinite(t)) t=0;
+    var n=times?times.length:0;
+    var tAt=function(h){
+      if(!n) return t + (h-((opts.candidatePos!=null)?opts.candidatePos:0))*(Number(opts.frameDur)||0);
+      if(h<=0) return times[0];
+      if(h>=n-1) return times[n-1];
+      var i0=Math.floor(h), f=h-i0;
+      return times[i0]+f*(times[i0+1]-times[i0]);
+    };
+    var out={relClass:'C', releaseT:t, candidateT:t, sepFound:false, sepIndex:null};
+    if(sep && sep.found && sep.index!=null && n>0 && sep.index<n){
+      out.relClass='A'; out.releaseT=tAt(sep.index); out.sepFound=true; out.sepIndex=sep.index;
+      out.sepDist=(typeof sep.dist==='number')?sep.dist:null;
+      return out;
+    }
+    // B: 弱検出の外挿（series のうち両側に weakMinPx 以上の差分塊がある点で d を線形フィットし d=0 を求める）
+    var weakMin=Math.max(1, Math.round(Number(opts.weakMinPx)||REAR_SEP_WEAK_MIN_PX));
+    var s=(sep&&sep.series)?sep.series:[];
+    var pts=[], i;
+    for(i=0;i<s.length;i++){ if(s[i].nPos>=weakMin && s[i].nNeg>=weakMin && s[i].d>0) pts.push(s[i]); }
+    if(pts.length>=2 && n>1){
+      var s0=0,s1=0,s2=0,u0=0,u1=0,j;
+      for(j=0;j<pts.length;j++){ var x=pts[j].index, y=pts[j].d; s0++; s1+=x; s2+=x*x; u0+=y; u1+=x*y; }
+      var den=s0*s2-s1*s1;
+      if(den>1e-12){
+        var bb=(s0*u1-s1*u0)/den, aa=(s2*u0-s1*u1)/den;
+        if(bb>0){
+          var h0=-aa/bb;
+          if(h0>=0 && h0<=n-1){
+            out.relClass='B'; out.releaseT=tAt(h0); out.sepFound=false; out.extrapolatedIndex=h0;
+            return out;
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  // 到達候補（純粋関数）: 捕球音オンセット候補（秒）の列から、リリース時刻 releaseT 以降で最初に立つものを
+  // 音速遅延補正（distM/343を差し引く既存 applySoundDelay）つきで返す。無い/不正なら null
+  function firstAudioOnsetAfter(peakSecs, releaseT, distM){
+    if(!peakSecs || !peakSecs.length) return null;
+    var t=Number(releaseT);
+    if(!isFinite(t)) return null;
+    var arr=peakSecs.map(function(p){ return Number(p); }).filter(function(p){ return isFinite(p); });
+    arr.sort(function(a,b){ return a-b; });
+    for(var i=0;i<arr.length;i++){
+      var c=applySoundDelay(arr[i], distM);
+      if(c>=t-1e-9) return {sec:c, rawSec:arr[i], delaySec:soundDelaySec(distM)};
+    }
+    return null;
+  }
+
   return {
     SAMPLE_MS:SAMPLE_MS, TRIG_MIN:TRIG_MIN, TRIG_RATIO:TRIG_RATIO, TRIG_STREAK:TRIG_STREAK,
     QUIET_ABS:QUIET_ABS, QUIET_RATIO:QUIET_RATIO, QUIET_MS:QUIET_MS, MAX_REC_MS:MAX_REC_MS, ARM_MS:ARM_MS,
@@ -2724,14 +2868,21 @@ var KYU=(function(){
     pickQuietFrame:pickQuietFrame, blobCentroid:blobCentroid, buildTrajSamples:buildTrajSamples,
     refineBallPath:refineBallPath, extractBallPathStaged:extractBallPathStaged,
     poseDetectFootContact:poseDetectFootContact, poseDetectReleaseCandidate:poseDetectReleaseCandidate,
-    poseComputeTempo:poseComputeTempo, poseSynthesizeThrow:poseSynthesizeThrow, poseSelfTest:poseSelfTest
+    poseComputeTempo:poseComputeTempo, poseSynthesizeThrow:poseSynthesizeThrow, poseSelfTest:poseSelfTest,
+    REAR_PLATE_WIDTH_M:REAR_PLATE_WIDTH_M, REAR_SEP_WIN_MS:REAR_SEP_WIN_MS, REAR_SEP_HALF:REAR_SEP_HALF,
+    REAR_SEP_THR:REAR_SEP_THR, REAR_SEP_MIN_PX:REAR_SEP_MIN_PX, REAR_SEP_DIST:REAR_SEP_DIST, REAR_SEP_WEAK_MIN_PX:REAR_SEP_WEAK_MIN_PX,
+    rearPlatePxPerMeter:rearPlatePxPerMeter, detectSeparation:detectSeparation,
+    classifyRelease:classifyRelease, firstAudioOnsetAfter:firstAudioOnsetAfter
   };
 })();
 if(typeof module!=='undefined' && module.exports){ module.exports=KYU; }
 /* ==KYU-PURE-END== */
+
+
 </script>
 
 <script>
+
 (function(){
 'use strict';
 var LS_KEY='kyusoku.results.v1';
@@ -2767,7 +2918,8 @@ var els={
   listDate:$('listDate'), stats:$('stats'), recordList:$('recordList'), toast:$('toast')
 };
 
-var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null, voiceOn:true, calib:{active:false, points:[], source:null, advanceM:null, pxPerM:null}, lastIvb:null, poseHand:'right', poseResult:null, shootMode:'side' };
+var state={ fps:60, releaseTime:null, arrivalTime:null, correction:1.2, distPreset:'18.44', customDist:'', camDistM:10, heightCm:'', loaded:false, seeking:false, view:'quick', lastSavedId:null, frameTimes:null, voiceOn:true, calib:{active:false, points:[], source:null, advanceM:null, pxPerM:null}, lastIvb:null, poseHand:'right', poseResult:null, shootMode:'side',
+  rearCalib:{active:false, points:[], pxPerM:null}, rearResult:null }; // §13 v0.4: 後方校正（動画ごとに保持・リセット）と後方球速モードの結果
 var q={ stream:null, starting:false, monitor:null, prev:null, gate:KYU.newGate(),
       mode:'off', mediaRec:null, chunks:[], mime:'', recStartAt:0, blob:null, recId:null, arrivalSource:'', analyzeUrl:null };
 var objectUrl=null;
@@ -3351,6 +3503,7 @@ els.video.addEventListener('loadedmetadata', function(){
   if(batchEls) batchEls.start.disabled=false; // 一括解析の開始ボタンを有効化
   updateCalibUI(); // タップ校正ボタンの有効/状態を動画読み込みに合わせる
   updatePoseUI();  // フォーム解析ボタンの有効/無効を動画読み込みに合わせる
+  updateRearCalibUI(); updateRearModeUI(); // §13 v0.4: 後方校正/後方球速モードカードも動画読み込みに合わせる
   updateFrameUI(); updateMarks(); updateResult();
 });
 els.video.addEventListener('timeupdate', function(){
@@ -3362,6 +3515,7 @@ els.video.addEventListener('pause', function(){ els.playBtn.textContent='再生'
 els.video.addEventListener('click', function(){
   if(!state.loaded) return;
   if(state.calib && state.calib.active) return; // 校正モード中のタップはラッパー側で校正点として処理する
+  if(state.rearCalib && state.rearCalib.active) return; // §13 v0.4: 後方校正モード中も同様
   if(els.video.paused){ els.video.play(); } else { els.video.pause(); }
 });
 
@@ -3377,6 +3531,8 @@ function loadDetailVideo(blob, label, keepMarks){
   state.loaded=false;
   state.frameTimes=null; // MP4でない・取得失敗時は currentTime 方式のまま
   resetCalibration(); // タップ校正は動画ごとに保持し、新しい動画を読み込んだらリセットする
+  resetRearCalib();   // §13 v0.4: 後方校正（rearPxPerMeter）も動画ごとに保持し、読み替えたらリセット（側面校正と同じ方針）
+  state.rearResult=null; // 前の動画の後方球速モード結果は無効化
   if(!keepMarks){ state.releaseTime=null; state.arrivalTime=null; }
   setControlsEnabled(false);
   els.seek.max=0; els.seek.value=0;
@@ -3991,6 +4147,20 @@ function computeResult(){
   if(state.releaseTime==null || state.arrivalTime==null) return {status:'incomplete'};
   return computeResultAt(state.releaseTime, state.arrivalTime);
 }
+// §13 v0.4: 結果パネルの下に後方球速モードの内訳（信頼性クラス・候補時刻・分離フレームの有無・到達ソース）を添える（rear時のみ。タイル数は不変）
+function rearResultNote(){
+  if(!isRear() || !state.rearResult) return '';
+  var rr=state.rearResult;
+  var clsTxt= rr.relClass==='A' ? 'A（分離を画像で確認・自動採用）'
+            : rr.relClass==='B' ? 'B（分離を外挿で推定）'
+            : 'C（姿勢候補のみ・手動確認が必要）';
+  return '<div class="small" style="margin-top:6px">後方球速モード 内訳: 信頼性クラス <b>'+clsTxt+'</b>'+
+    ' ・ リリース候補時刻 '+(rr.candidateT!=null?rr.candidateT.toFixed(3)+'s':'—')+
+    ' ・ 分離フレーム '+(rr.sepFound?'あり（精密化後 F'+pad(frameNoOf(rr.releaseT),4)+'）':'なし')+
+    ' ・ 到達 '+(rr.arrivalSource==='audio-onset'?'捕球音オンセット（音速遅延補正済み）':'手動マークにフォールバック')+
+    (rr.relClass==='C' && !rr.confirmed ? ' ・ <span class="err">クラスCのため「この時刻で確定」を押すまで保存できません</span>' : '')+
+    '</div>';
+}
 function updateResult(){
   var r=computeResult();
   if(r.status==='incomplete'){
@@ -3998,14 +4168,17 @@ function updateResult(){
   }else if(r.status==='error'){
     els.result.innerHTML='<div class="err">'+r.msg+'</div>';
   }else{
-    els.result.innerHTML=resultPanelHTML(r, state.lastSavedId);
+    els.result.innerHTML=resultPanelHTML(r, state.lastSavedId)+rearResultNote();
     if(lastResultStatus!=='ok'){ els.result.scrollIntoView({behavior:'smooth', block:'center'}); } // 計測確定の瞬間に結果パネルを画面の主役にする
   }
   lastResultStatus=r.status;
-  els.saveBtn.disabled = r.status!=='ok';
+  // §13 v0.4: rear で信頼性クラスCかつ未確定の間は保存ボタンを無効化する
+  var rearBlockSave = isRear() && state.rearResult && state.rearResult.relClass==='C' && !state.rearResult.confirmed;
+  els.saveBtn.disabled = r.status!=='ok' || rearBlockSave;
   els.shareCurrentBtn.disabled = r.status!=='ok';
   updateTrajUI(); // 軌道抽出ボタンの有効/無効（リリース点・到達点の設定状態に追従）
   updatePoseUI(); // フォーム解析ボタンの有効/無効（動画読み込み・リリース点の設定状態に追従）
+  updateRearModeUI(); // §13 v0.4: 後方球速モードの確定ボタン表示も結果に追従
   renderQuickResult();
 }
 
@@ -4045,11 +4218,25 @@ function makeRecord(r, o){
       rec.ivbCm=state.lastIvb.ivbCm; // 現マークに対応する合格済み抽出結果があれば記録へ
     }
   }
+  // §13 v0.4 後方球速モード（Game Mode）: rear では記録の source を rear-auto とし、信頼性クラス relClass と
+  // 後方校正の rearPxPerMeter（校正済みの場合）を記録へ含める
+  if(isRear()){
+    if(o.source==='detail' || !o.source) rec.source='rear-auto';
+    if(state.rearResult && state.rearResult.relClass!=null) rec.relClass=state.rearResult.relClass;
+    var rp=(state.rearCalib && typeof state.rearCalib.pxPerM==='number' && isFinite(state.rearCalib.pxPerM) && state.rearCalib.pxPerM>0)
+      ? state.rearCalib.pxPerM : null;
+    if(rp!=null) rec.rearPxPerMeter=rp;
+  }
   return rec;
 }
 els.saveBtn.addEventListener('click', function(){
   var r=computeResult();
   if(r.status!=='ok') return;
+  // §13 v0.4: rear で信頼性クラスCかつ未確定なら保存しない（ボタン無効だが直接呼び出しにもガード）
+  if(isRear() && state.rearResult && state.rearResult.relClass==='C' && !state.rearResult.confirmed){
+    toast('信頼性クラスCは「この時刻で確定」を押してから保存してください');
+    return;
+  }
   var all=loadAll();
   var key=todayKey();
   if(!all[key]) all[key]=[];
@@ -4247,6 +4434,7 @@ function setShootMode(m){
   if(m!==SHOOT_MODE_SIDE && m!==SHOOT_MODE_REAR) return;
   state.shootMode=m;
   if(m===SHOOT_MODE_REAR && state.calib && state.calib.active && typeof cancelCalibration==='function') cancelCalibration(); // 校正途中に後方へ切替えたら中断
+  if(m===SHOOT_MODE_SIDE && state.rearCalib && state.rearCalib.active && typeof cancelRearCalibration==='function') cancelRearCalibration(); // §13 v0.4: 後方校正途中に側面へ切替えたら中断
   saveQuickSettings();
   updateShootModeUI();
 }
@@ -4257,6 +4445,7 @@ function updateShootModeUI(){
     if(s.guide) s.guide.hidden=!rear;
   });
   updateTrajUI(); updateCalibUI(); updatePoseUI(); // モード依存カードのボタン/理由表示を更新
+  updateRearCalibUI(); updateRearModeUI(); // §13 v0.4: 後方校正/後方球速モードカード（rear時のみ表示）
   updateResult();
 }
 // クイック/詳細の各画面へ「撮影モード」セグメント＋rear時だけ表示する後方撮影ガイドをJSで挿入（HTML無変更）
@@ -4318,13 +4507,14 @@ function ensureVideoWrap(){
   videoWrap.appendChild(calibOverlay);
   // 校正モード中のタップはここで受け、レターボックス補正つきで実映像座標に変換して点を打つ
   videoWrap.addEventListener('click', function(e){
-    var c=state.calib;
-    if(!c || !c.active || !state.loaded) return;
     var el=v;
-    if(!(el.videoWidth>0) || !(el.videoHeight>0)) return;
+    if(!(el.videoWidth>0) || !(el.videoHeight>0) || !state.loaded) return;
     var r=el.getBoundingClientRect();
     var pt=KYU.clientToVideoPx(e.clientX, e.clientY, {left:r.left, top:r.top, width:r.width, height:r.height}, el.videoWidth, el.videoHeight);
     if(!pt) return;
+    if(state.rearCalib && state.rearCalib.active){ addRearCalibPoint(pt); return; } // §13 v0.4: 後方校正（rear時のみ）
+    var c=state.calib;
+    if(!c || !c.active) return;
     addCalibPoint(pt);
   });
   return videoWrap;
@@ -4437,31 +4627,125 @@ function updateCalibUI(){
     : '';
 }
 // 校正点マーカーを動画上に絶対配置で重ねる（実映像座標→表示%へレターボックス補正して配置）
+// §13 v0.4: 側面タップ校正の点（投/ベ/リ）と後方校正の点（左/右）を同じオーバーレイに描く
 function renderCalibMarkers(){
   if(!calibOverlay) return;
   calibOverlay.innerHTML='';
-  var pts=(state.calib && state.calib.points) || [];
   var v=els.video;
-  if(!(v.videoWidth>0) || !(v.videoHeight>0) || !pts.length) return;
+  if(!(v.videoWidth>0) || !(v.videoHeight>0)) return;
   var rect=v.getBoundingClientRect();
-  pts.forEach(function(pt, i){
+  function dot(pt, label){
     var pos=KYU.videoPxToPercent(pt.x, pt.y, v.videoWidth, v.videoHeight, rect.width, rect.height);
     if(!pos) return;
-    var dot=document.createElement('div');
-    dot.className='calib-dot';
-    dot.style.position='absolute';
-    dot.style.left=pos.left+'%'; dot.style.top=pos.top+'%';
-    dot.style.width='20px'; dot.style.height='20px';
-    dot.style.margin='-10px 0 0 -10px';
-    dot.style.borderRadius='50%';
-    dot.style.background='rgba(255,213,79,0.95)';
-    dot.style.border='2px solid #d23b3b';
-    dot.style.pointerEvents='none';
-    dot.style.display='flex'; dot.style.alignItems='center'; dot.style.justifyContent='center';
-    dot.style.fontSize='10px'; dot.style.fontWeight='700'; dot.style.color='#3a1010';
-    dot.textContent=CALIB_LABELS[i]||String(i+1);
-    calibOverlay.appendChild(dot);
-  });
+    var d=document.createElement('div');
+    d.className='calib-dot';
+    d.style.position='absolute';
+    d.style.left=pos.left+'%'; d.style.top=pos.top+'%';
+    d.style.width='20px'; d.style.height='20px';
+    d.style.margin='-10px 0 0 -10px';
+    d.style.borderRadius='50%';
+    d.style.background='rgba(255,213,79,0.95)';
+    d.style.border='2px solid #d23b3b';
+    d.style.pointerEvents='none';
+    d.style.display='flex'; d.style.alignItems='center'; d.style.justifyContent='center';
+    d.style.fontSize='10px'; d.style.fontWeight='700'; d.style.color='#3a1010';
+    d.textContent=label;
+    calibOverlay.appendChild(d);
+  }
+  var pts=(state.calib && state.calib.points) || [];
+  pts.forEach(function(pt, i){ dot(pt, CALIB_LABELS[i]||String(i+1)); });
+  var rpts=(state.rearCalib && state.rearCalib.points) || [];
+  rpts.forEach(function(pt, i){ dot(pt, REAR_CALIB_LABELS[i]||String(i+1)); });
+}
+
+/* ---- §13 v0.4 後方校正カード（rear時のみ有効・JS生成UI。HTMLは無変更） ----
+   後方（試合）撮影で、ホームベース前端の左端と右端をタップし、実幅43.2cmからプレート面の px/m を
+   算出して動画ごとに保持する（動画を読み替えたらリセット＝側面校正と同じ方針）。
+   球速計算自体はフレームタイミング法なので校正なしでも動く。将来のプレート通過位置表示の基礎データで、
+   記録には rearPxPerMeter として保存する。 */
+var rearCalibEls=null;
+var REAR_CALIB_STEPS=['ホームベース前端の左端','ホームベース前端の右端'];
+var REAR_CALIB_LABELS=['左','右'];
+function buildRearCalibUI(){
+  if(rearCalibEls) return;
+  ensureVideoWrap();
+  var card=document.createElement('div');
+  card.className='card'; card.id='rearCalibCard';
+  card.innerHTML=
+    '<h2>後方校正（ホームベース幅タップ・rear専用）</h2>'+
+    '<p class="muted small">後方撮影では、ホームベース前端の左端と右端の2点をタップし、実幅43.2cmからプレート面の px/m（rearPxPerMeter）を算出します。動画を読み替えるとリセットされます。球速計算（フレームタイミング法）自体は校正なしでも動きます。この縮尺は将来のプレート通過位置表示の基礎データです。</p>'+
+    '<div class="mark-row" style="margin-top:8px">'+
+      '<button class="btn btn-primary" id="rearCalibStartBtn" disabled>後方校正を開始</button>'+
+      '<button class="btn btn-accent" id="rearCalibCancelBtn" hidden>キャンセル</button>'+
+    '</div>'+
+    '<p id="rearCalibStatus" class="muted small" style="margin-top:6px"></p>'+
+    '<p id="rearCalibResult" class="small" style="margin-top:2px;font-weight:700"></p>';
+  var anchor=(calibEls && calibEls.card) || els.video.closest('.card'); // タップ校正カードの直後に挿入
+  (anchor && anchor.parentNode ? anchor.parentNode : els.detailView).insertBefore(card, anchor ? anchor.nextSibling : null);
+  rearCalibEls={
+    card:card, start:$('rearCalibStartBtn'), cancel:$('rearCalibCancelBtn'),
+    status:$('rearCalibStatus'), result:$('rearCalibResult')
+  };
+  rearCalibEls.start.addEventListener('click', function(){ startRearCalibration(); });
+  rearCalibEls.cancel.addEventListener('click', function(){ cancelRearCalibration(); });
+  updateRearCalibUI();
+}
+function startRearCalibration(){
+  if(!isRear()){ toast('後方校正は「後方（試合）」撮影でのみ有効です'); return; } // rear時のみ有効
+  if(!state.loaded){ toast('先に動画を読み込んでください'); return; }
+  if(!(els.video.videoWidth>0)){ toast('動画の読み込みが完了してから開始してください'); return; }
+  els.video.pause();
+  state.rearCalib.active=true; state.rearCalib.points=[]; // 既存の pxPerM は維持（やり直しで上書き）
+  renderCalibMarkers(); updateRearCalibUI();
+}
+function cancelRearCalibration(){
+  state.rearCalib.active=false; state.rearCalib.points=[];
+  renderCalibMarkers(); updateRearCalibUI();
+}
+function resetRearCalib(){ // 動画を読み替えたら後方校正もリセット（側面校正と同じ方針）
+  state.rearCalib={active:false, points:[], pxPerM:null};
+  renderCalibMarkers(); updateRearCalibUI();
+}
+function addRearCalibPoint(pt){
+  var c=state.rearCalib;
+  if(!c || !c.active || c.points.length>=2) return;
+  c.points.push(pt);
+  renderCalibMarkers();
+  if(c.points.length>=2) finishRearCalibration();
+  else updateRearCalibUI();
+}
+function finishRearCalibration(){
+  var c=state.rearCalib;
+  var ppm=KYU.rearPlatePxPerMeter(c.points[0], c.points[1]); // 実幅43.2cm（既定）でプレート面 px/m
+  if(ppm==null){
+    c.active=false; c.points=[];
+    renderCalibMarkers(); updateRearCalibUI();
+    toast('2点がほぼ同じ位置のため後方校正できませんでした。やり直してください');
+    return;
+  }
+  c.pxPerM=ppm; c.active=false;
+  renderCalibMarkers(); updateRearCalibUI();
+  toast('後方校正: プレート面 '+ppm.toFixed(1)+' px/m（ホームベース幅43.2cm 換算）');
+}
+function updateRearCalibUI(){
+  if(!rearCalibEls) return;
+  var rear=isRear();
+  rearCalibEls.card.hidden=!rear; // rear時のみ有効（sideではカードごと非表示＝従来どおり）
+  if(!rear) return;
+  var c=state.rearCalib||{active:false, points:[], pxPerM:null};
+  var n=c.points ? c.points.length : 0;
+  rearCalibEls.start.disabled=!(state.loaded && (els.video.videoWidth>0));
+  rearCalibEls.cancel.hidden=!c.active;
+  if(c.active){
+    rearCalibEls.status.textContent='後方校正モード中: ('+(n+1)+'/2) '+REAR_CALIB_STEPS[n]+' を動画上でタップしてください';
+  }else{
+    rearCalibEls.status.textContent = (typeof c.pxPerM==='number' && isFinite(c.pxPerM) && c.pxPerM>0)
+      ? '校正済みです（この動画限定）。やり直す場合は「後方校正を開始」を押してください'
+      : '未校正です。「後方校正を開始」を押し、ホームベース前端の左端・右端をタップしてください（球速計測自体は校正なしでも動きます）';
+  }
+  rearCalibEls.result.textContent = (typeof c.pxPerM==='number' && isFinite(c.pxPerM) && c.pxPerM>0)
+    ? 'プレート面 '+c.pxPerM.toFixed(1)+' px/m（rearPxPerMeter・ホームベース幅 43.2cm 換算）'
+    : '';
 }
 
 /* ---- Phase 3-B: ボール軌道抽出と縦変化量の実験表示（詳細モード・JS生成UI。HTMLは無変更） ----
@@ -4790,10 +5074,10 @@ function buildPoseUI(){
 }
 function updatePoseUI(){
   if(!poseEls) return;
-  var rear=isRear(); // §13 v0.13: rearではフォーム解析（テンポ・側面幾何学）を無効化し理由を明示
+  var rear=isRear(); // §13 v0.13/v0.4: rearではテンポは側面撮影専用のまま無効。ただし姿勢推定自体は後方球速モードのリリース候補生成に使う
   if(poseEls.note){
     poseEls.note.hidden=!rear;
-    if(rear) poseEls.note.textContent='フォーム解析（テンポ）は側面撮影専用です。後方撮影では球速のみ計測できます';
+    if(rear) poseEls.note.textContent='テンポは側面撮影専用です。後方撮影では球速のみ計測できます（姿勢推定は「後方球速モード」カードのリリース候補生成に使用します）';
   }
   poseEls.start.disabled = rear || !(state.loaded && state.releaseTime!=null && !poseRunning);
 }
@@ -4854,68 +5138,19 @@ function runPoseAnalysis(){
   var preSec=Math.max(0.5, Math.min(10, Number(poseEls.pre.value)||POSE_PRE_SEC));
   var postSec=Math.max(0.5, Math.min(10, Number(poseEls.post.value)||POSE_POST_SEC));
   var center=state.releaseTime;
-  var fpsEff=KYU.fpsFromFrameTimes(state.frameTimes)||state.fps;
   var t0=Math.max(0, center-preSec), t1=Math.min(v.duration, center+postSec);
-  var lm=null; // 実行中の Landmarker
   setPoseProgress(2, 'モデル読み込み中…（CDNから tasks-vision を動的読み込み）');
-  return poseLoadLib().then(function(lib){
-    var FilesetResolver=lib.pkg.FilesetResolver, PoseLandmarker=lib.pkg.PoseLandmarker;
-    if(!FilesetResolver || !PoseLandmarker) throw new Error('tasks-vision の読み込みに失敗しました（FilesetResolver/PoseLandmarker がありません）');
-    setPoseProgress(4, 'WASMランタイム読み込み中…（@mediapipe/tasks-vision@'+lib.ver+'）');
-    return FilesetResolver.forVisionTasks(lib.wasmBase).then(function(vision){
-      function create(del){
-        return PoseLandmarker.createFromOptions(vision, {
-          baseOptions:{ modelAssetPath:POSE_MODEL_URL, delegate:del },
-          runningMode:'VIDEO',
-          numPoses:1
-        });
-      }
-      return create('GPU').catch(function(){ return create('WASM'); }); // GPUデリゲート失敗時はWASM(CPU)へ
-    });
-  }).then(function(l){
-    lm=l;
-    setPoseProgress(8, '姿勢推定中… '+t0.toFixed(2)+'s 〜 '+t1.toFixed(2)+'s（実効 '+fpsEff.toFixed(1)+'fps）');
-    var step=1/fpsEff;
-    var n=Math.max(1, Math.floor((t1-t0)/step));
-    var frames=[];
-    var i=0;
-    function loop(){
-      if(i>n){
-        setPoseProgress(100, '処理完了: '+(n+1)+' フレーム（ランドマーク取得 '+frames.filter(function(f){ return f.landmarks; }).length+'）');
-        return Promise.resolve(frames);
-      }
-      var t=Math.min(t0+i*step, t1);
-      return seekVideo(v, t).then(function(){
-        var lmk=null;
-        try{
-          var r=lm.detectForVideo(v, Math.round(t*1000)); // タイムスタンプは ms で単調増加が必要
-          if(r && r.landmarks && r.landmarks[0]) lmk=posePickLandmarks(r.landmarks[0]);
-        }catch(e){ lmk=null; } // 推論失敗フレームはスキップ
-        frames.push({t:t, landmarks:lmk});
-        if(i % Math.max(1, Math.floor(n/20)) === 0){
-          setPoseProgress(8+Math.round(90*i/n), '姿勢推定中… '+i+'/'+(n+1)+' フレーム（'+Math.round(100*i/n)+'%）');
-          return new Promise(function(r2){ setTimeout(r2, 0); }).then(loop); // ときどきUIへ制御を戻す
-        }
-        i++;
-        return loop();
-      });
-    }
-    return loop();
-  }).then(function(frames){
-    try{ if(lm && lm.close) lm.close(); }catch(e){}
-    lm=null; poseLandmarker=null;
+  return poseEstimateWindow(v, t0, t1, function(pct, msg){ setPoseProgress(2+Math.round(pct*96), msg); }).then(function(frames){
     // イベント検出（KYUへ移植したPoCロジック。direction=+1固定）
     var res=KYU.poseComputeTempo(frames, {hand:hand, direction:1});
     res.frames=frames;
     res.frameCount=frames.length;
     res.validCount=frames.filter(function(f){ return f.landmarks; }).length;
-    res.hand=hand; res.centerReleaseTime=center; res.preSec=preSec; res.postSec=postSec; res.fps=fpsEff;
+    res.hand=hand; res.centerReleaseTime=center; res.preSec=preSec; res.postSec=postSec; res.fps=KYU.fpsFromFrameTimes(state.frameTimes)||state.fps;
     state.poseResult=res;
     poseRenderResult(res);
     return res;
   }).catch(function(e){
-    try{ if(lm && lm.close) lm.close(); }catch(e2){}
-    lm=null; poseLandmarker=null;
     // CDN読み込み失敗など: カード内にエラーを表示するだけでアプリ本体は落とさない
     if(poseEls){
       poseEls.err.textContent='フォーム解析に失敗しました: '+(e && e.message ? e.message : String(e))+
@@ -4932,6 +5167,284 @@ function runPoseAnalysis(){
     try{ els.seek.value=curFrame(); updateFrameUI(); }catch(e){}
     return r;
   });
+}
+
+/* ---- §13 v0.4 姿勢推定コア（フォーム解析カードと後方球速モードで共用） ----
+   [t0,t1] 区間をシークしながらフレームごとに Pose Landmarker で推論し、ランドマーク列 [{t, landmarks}] を返す。
+   CDNからライブラリ動的読み込み → Landmarker生成(GPU→WASM)。onProgress(pct 0..1, msg) で進捗通知。
+   失敗時は reject（呼び出し側でカード内エラー表示のみ。アプリ本体は落とさない） */
+function poseEstimateWindow(v, t0, t1, onProgress){
+  var fpsEff=KYU.fpsFromFrameTimes(state.frameTimes)||state.fps;
+  var lm=null; // 実行中の Landmarker
+  return poseLoadLib().then(function(lib){
+    var FilesetResolver=lib.pkg.FilesetResolver, PoseLandmarker=lib.pkg.PoseLandmarker;
+    if(!FilesetResolver || !PoseLandmarker) throw new Error('tasks-vision の読み込みに失敗しました（FilesetResolver/PoseLandmarker がありません）');
+    if(onProgress) onProgress(0.04, 'WASMランタイム読み込み中…（@mediapipe/tasks-vision@'+lib.ver+'）');
+    return FilesetResolver.forVisionTasks(lib.wasmBase).then(function(vision){
+      function create(del){
+        return PoseLandmarker.createFromOptions(vision, {
+          baseOptions:{ modelAssetPath:POSE_MODEL_URL, delegate:del },
+          runningMode:'VIDEO',
+          numPoses:1
+        });
+      }
+      return create('GPU').catch(function(){ return create('WASM'); }); // GPUデリゲート失敗時はWASM(CPU)へ
+    });
+  }).then(function(l){
+    lm=l;
+    if(onProgress) onProgress(0.08, '姿勢推定中… '+t0.toFixed(2)+'s 〜 '+t1.toFixed(2)+'s（実効 '+fpsEff.toFixed(1)+'fps）');
+    var step=1/fpsEff;
+    var n=Math.max(1, Math.floor((t1-t0)/step));
+    var frames=[];
+    var i=0;
+    function loop(){
+      if(i>n){
+        if(onProgress) onProgress(1, '処理完了: '+(n+1)+' フレーム（ランドマーク取得 '+frames.filter(function(f){ return f.landmarks; }).length+'）');
+        return Promise.resolve(frames);
+      }
+      var t=Math.min(t0+i*step, t1);
+      return seekVideo(v, t).then(function(){
+        var lmk=null;
+        try{
+          var r=lm.detectForVideo(v, Math.round(t*1000)); // タイムスタンプは ms で単調増加が必要
+          if(r && r.landmarks && r.landmarks[0]) lmk=posePickLandmarks(r.landmarks[0]);
+        }catch(e){ lmk=null; } // 推論失敗フレームはスキップ
+        frames.push({t:t, landmarks:lmk});
+        if(i % Math.max(1, Math.floor(n/20)) === 0){
+          if(onProgress) onProgress(0.08+0.92*i/n, '姿勢推定中… '+i+'/'+(n+1)+' フレーム（'+Math.round(100*i/n)+'%）');
+          return new Promise(function(r2){ setTimeout(r2, 0); }).then(loop); // ときどきUIへ制御を戻す
+        }
+        i++;
+        return loop();
+      });
+    }
+    return loop();
+  }).then(function(frames){
+    try{ if(lm && lm.close) lm.close(); }catch(e){}
+    lm=null; poseLandmarker=null;
+    return frames;
+  }, function(e){
+    try{ if(lm && lm.close) lm.close(); }catch(e2){}
+    lm=null; poseLandmarker=null;
+    throw e;
+  });
+}
+
+/* ---- §13 v0.4 後方球速モード（Game Mode）本体（rear時のみ有効・JS生成UI。HTMLは無変更） ----
+   流れ: ①姿勢推定（poseEstimateWindow をリリース候補生成として使用）でリリース候補時刻を得る
+        ②候補の前後±40msの窓を手首位置周辺ROIのフレーム差分（KYU.detectSeparation）で走査し、
+          ボール相当の差分塊が手から離れる最初のフレーム＝分離フレームを特定（KYU.classifyRelease でクラスA/B/C判定）
+        ③到達は一括解析と同じ音声オンセット検出（scanAudioPeaks）のうちリリース以降で最初のものを
+          音速遅延補正つきで採用（KYU.firstAudioOnsetAfter）。音声が無い/取れない場合は手動マークにフォールバックする旨を表示
+        ④リリース（精密化後）と到達から既存の computeResultAt で球速＋初速換算を計算し結果パネルへ表示。
+          記録は source=rear-auto、relClass、rearPxPerMeter（校正済み時）を付与。クラスCは「この時刻で確定」まで保存不可。 */
+var rearModeEls=null;
+var rearRunning=false;
+function buildRearModeUI(){
+  if(rearModeEls) return;
+  var card=document.createElement('div');
+  card.className='card'; card.id='rearModeCard';
+  card.innerHTML=
+    '<h2>後方球速モード（Game Mode・rear専用）</h2>'+
+    '<p class="muted small">後方撮影の動画から球速を自動計測します。姿勢推定でリリース候補時刻を生成し（候補の前後±'+KYU.REAR_SEP_WIN_MS+'msの窓）、手首周辺のフレーム差分でボールが手から離れる分離フレームを特定してリリース時刻を精密化します。到達は捕球音オンセット（音速遅延補正つき）を第一候補とし、音声が取れない場合は手動マークにフォールバックします。信頼性クラス: A=分離を画像で確認（自動採用）、B=分離を外挿で推定（推定と表示）、C=姿勢候補のみ（手動確認が必要・保存は「この時刻で確定」後）。</p>'+
+    '<div class="mark-row" style="margin-top:8px">'+
+      '<button class="btn btn-primary" id="rearModeStartBtn" disabled>後方球速を自動計測</button>'+
+      '<button class="btn btn-accent" id="rearModeConfirmBtn" hidden>この時刻で確定</button>'+
+    '</div>'+
+    '<progress id="rearModeBar" max="100" value="0" style="width:100%;margin-top:8px" hidden></progress>'+
+    '<p id="rearModeStatus" class="muted small" style="margin-top:6px"></p>'+
+    '<div id="rearModeResult" class="small" style="margin-top:6px"></div>';
+  var anchor=(poseEls && poseEls.card) || els.video.closest('.card'); // フォーム解析カードの直後に挿入
+  (anchor && anchor.parentNode ? anchor.parentNode : els.detailView).insertBefore(card, anchor ? anchor.nextSibling : null);
+  rearModeEls={
+    card:card, start:$('rearModeStartBtn'), confirm:$('rearModeConfirmBtn'),
+    bar:$('rearModeBar'), status:$('rearModeStatus'), result:$('rearModeResult')
+  };
+  rearModeEls.start.addEventListener('click', function(){ runRearAuto(); });
+  rearModeEls.confirm.addEventListener('click', function(){ confirmRearResult(); });
+  updateRearModeUI();
+}
+function updateRearModeUI(){
+  if(!rearModeEls) return;
+  var rear=isRear();
+  rearModeEls.card.hidden=!rear; // rear時のみ有効（sideではカードごと非表示＝従来どおり）
+  if(!rear) return;
+  rearModeEls.start.disabled = !(state.loaded && !rearRunning);
+  var rr=state.rearResult;
+  rearModeEls.confirm.hidden = !(rr && rr.relClass==='C' && !rr.confirmed); // クラスCは確定ボタンが必要
+}
+function setRearModeProgress(pct, msg){
+  if(!rearModeEls) return;
+  rearModeEls.bar.hidden=false; rearModeEls.bar.value=pct;
+  if(msg!=null) rearModeEls.status.textContent=msg;
+}
+function setRearModeStatus(msg){ if(rearModeEls) rearModeEls.status.textContent=msg; }
+// リリース候補時刻に最も近い姿勢フレームの利き腕手首ランドマークをスキャン座標(SCAN_W×SCAN_H)で返す
+function scanWristAt(poseFrames, t){
+  if(!poseFrames || !poseFrames.length) return null;
+  var best=null, bd=Infinity, i;
+  for(i=0;i<poseFrames.length;i++){
+    var f=poseFrames[i];
+    if(!f || typeof f.t!=='number') continue;
+    var d=Math.abs(f.t-t);
+    if(d<bd){ bd=d; best=f; }
+  }
+  if(!best || !best.landmarks) return null;
+  var key=(state.poseHand==='left'?'left':'right')+'Wrist';
+  var lm=best.landmarks[key];
+  if(!lm || !isFinite(lm.x) || !isFinite(lm.y)) return null;
+  return {x:lm.x*SCAN_W, y:lm.y*SCAN_H};
+}
+// リリース精密化: 候補時刻 candidateT の前後±REAR_SEP_WIN_MS の窓をフレーム走査し、手首ROIの差分で分離フレームを検出してクラス判定する
+// o.getGray(i) を渡せばそのフレーム取得を使う（テスト用合成入力）。無ければ動画をスキャンキャンバスで読む
+function rearRefineRelease(candidateT, cx, cy, poseFrames, o){
+  o=o||{};
+  var v=els.video;
+  var fpsEff=KYU.fpsFromFrameTimes(state.frameTimes)||state.fps;
+  var winSec=KYU.REAR_SEP_WIN_MS/1000;
+  var ft=(state.frameTimes && state.frameTimes.length) ? state.frameTimes : null;
+  var maxIdx=ft ? ft.length-1 : Math.max(0, Math.round((v.duration||0)*fpsEff)-1);
+  var i0, i1, tOf;
+  if(ft){
+    i0=KYU.frameIndexAt(ft, Math.max(0, candidateT-winSec));
+    i1=Math.min(maxIdx, KYU.frameIndexAt(ft, candidateT+winSec));
+    tOf=function(i){ return KYU.timeOfFrame(ft, i); };
+  }else{
+    i0=Math.max(0, Math.round((candidateT-winSec)*fpsEff));
+    i1=Math.min(maxIdx, Math.round((candidateT+winSec)*fpsEff));
+    tOf=function(i){ return i/fpsEff; };
+  }
+  if(i1<i0) i1=i0;
+  if(i1<=i0) i1=Math.min(maxIdx, i0+1);
+  var getGray=o.getGray;
+  if(!getGray){
+    var x=getScanCtx();
+    getGray=function(i){
+      return seekVideo(v, tOf(i)).then(function(){
+        try{
+          x.drawImage(v,0,0,SCAN_W,SCAN_H);
+          return {gray:KYU.toGray(x.getImageData(0,0,SCAN_W,SCAN_H).data), width:SCAN_W, height:SCAN_H};
+        }catch(e){ return null; }
+      });
+    };
+  }
+  var frames=[], times=[], chain=Promise.resolve(), i;
+  for(i=i0;i<=i1;i++){
+    (function(i){
+      chain=chain.then(function(){
+        return Promise.resolve(getGray(i)).then(function(g){
+          if(g && g.gray){ frames.push({i:i, gray:g.gray, width:g.width, height:g.height}); times.push(tOf(i)); }
+        });
+      });
+    })(i);
+  }
+  return chain.then(function(){
+    if(!frames.length) return {candidateT:candidateT, relClass:'C', releaseT:candidateT, sepFound:false, sepIndex:null, sepAbsIndex:null, framesScanned:0};
+    var sep=KYU.detectSeparation(frames, {cx:cx, cy:cy, half:o.half||KYU.REAR_SEP_HALF, thr:o.thr, minPx:o.minPx, sepDist:o.sepDist, baseIndex:0});
+    var candPos=0, bd=Infinity;
+    for(i=0;i<times.length;i++){ var d=Math.abs(times[i]-candidateT); if(d<bd){ bd=d; candPos=i; } }
+    var cls=KYU.classifyRelease(candidateT, sep, times, {candidatePos:candPos, frameDur:1/fpsEff});
+    var pos=cls.sepIndex;
+    return {
+      candidateT:candidateT, relClass:cls.relClass, releaseT:cls.releaseT,
+      sepFound:!!cls.sepFound, sepIndex:pos, sepAbsIndex:(pos!=null && frames[pos]) ? frames[pos].i : null,
+      sepDist:(typeof cls.sepDist==='number') ? cls.sepDist : (sep&&sep.dist)||0,
+      framesScanned:frames.length, windowStart:times[0], windowEnd:times[times.length-1]
+    };
+  });
+}
+// 後方球速モードの自動計測: 姿勢推定でリリース候補 → ±40ms窓の差分で分離検出（クラス判定） → 捕球音オンセットで到達 → 球速計算
+function runRearAuto(){
+  if(rearRunning) return Promise.resolve(null);
+  if(!isRear()){ toast('後方球速モードは「後方（試合）」撮影でのみ有効です'); return Promise.resolve(null); }
+  if(!state.loaded){ toast('先に動画を読み込んでください'); return Promise.resolve(null); }
+  var v=els.video;
+  if(!(v.duration>0)){ toast('動画の読み込みが完了してから実行してください'); return Promise.resolve(null); }
+  rearRunning=true; updateRearModeUI();
+  if(rearModeEls){ rearModeEls.result.innerHTML=''; rearModeEls.bar.hidden=false; rearModeEls.bar.value=0; setRearModeStatus(''); }
+  v.pause();
+  var savedPos=v.currentTime;
+  var center=(state.releaseTime!=null) ? state.releaseTime : v.duration/2;
+  var preSec=Math.max(0.5, Math.min(10, Number(poseEls?poseEls.pre.value:0)||POSE_PRE_SEC));
+  var postSec=Math.max(0.5, Math.min(10, Number(poseEls?poseEls.post.value:0)||POSE_POST_SEC));
+  var t0=(state.releaseTime!=null) ? Math.max(0, center-preSec) : 0;   // リリースマーク未設定なら動画全体を走査
+  var t1=(state.releaseTime!=null) ? Math.min(v.duration, center+postSec) : v.duration;
+  setRearModeProgress(2, '姿勢推定でリリース候補を生成中…（CDNからモデル読み込み）');
+  return poseEstimateWindow(v, t0, t1, function(pct, msg){ setRearModeProgress(2+Math.round(pct*50), msg); }).then(function(poseFrames){
+    if(!poseFrames || !poseFrames.length) throw new Error('姿勢ランドマークを取得できませんでした');
+    var rc=KYU.poseDetectReleaseCandidate(poseFrames, {hand:state.poseHand, direction:1});
+    if(!rc || rc.t==null) throw new Error('リリース候補を検出できませんでした');
+    setRearModeProgress(55, 'リリース候補 F'+pad(frameNoOf(rc.t),4)+'（'+rc.t.toFixed(3)+'s）の前後±'+KYU.REAR_SEP_WIN_MS+'msを画像差分で精密化中…');
+    var wrist=scanWristAt(poseFrames, rc.t);
+    return rearRefineRelease(rc.t, wrist?wrist.x:SCAN_W/2, wrist?wrist.y:SCAN_H/2, poseFrames).then(function(ref){
+      setRearModeProgress(75, '捕球音から到達候補を検出中…（一括解析と同じ音声オンセット検出）');
+      var peaksP=(detailBlob ? scanAudioPeaks(detailBlob) : Promise.resolve(null));
+      return peaksP.then(function(peaks){
+        var arr=null;
+        if(peaks && peaks.length){
+          var hit=KYU.firstAudioOnsetAfter(peaks.map(function(p){ return p.sec; }), ref.releaseT, state.camDistM);
+          if(hit) arr=hit.sec;
+        }
+        state.releaseTime=ref.releaseT;
+        if(arr!=null) state.arrivalTime=arr;
+        state.rearResult={
+          relClass:ref.relClass, releaseT:ref.releaseT, candidateT:ref.candidateT,
+          sepFound:ref.sepFound, sepIndex:ref.sepAbsIndex!=null?ref.sepAbsIndex:ref.sepIndex,
+          arrivalT:(arr!=null?arr:null), arrivalSource:(arr!=null?'audio-onset':'manual'), confirmed:false
+        };
+        updateMarks(); updateResult(); renderRearModeResult(); updateRearModeUI();
+        setRearModeProgress(100, '完了');
+        if(arr==null){
+          setRearModeStatus('音声から捕球音オンセットを検出できませんでした。到達点は「到達点をマーク」ボタンで手動設定してください（手動マークにフォールバック）。リリース時刻はクラス'+ref.relClass+'で確定しています');
+        }else{
+          setRearModeStatus('到達候補: 捕球音オンセット '+arr.toFixed(3)+'s（音速遅延補正 -'+Math.round(KYU.soundDelaySec(state.camDistM)*1000)+'ms適用）。信頼性クラス '+ref.relClass+' でリリース='+ref.releaseT.toFixed(3)+'s に確定しました');
+        }
+        return state.rearResult;
+      });
+    });
+  }).catch(function(e){
+    setRearModeProgress(100, '解析失敗');
+    setRearModeStatus('後方球速の自動計測に失敗しました: '+(e && e.message ? e.message : String(e))+
+      '（CDNにアクセスできない環境では姿勢推定が使えません。アプリ本体の動作には影響しません）');
+    return null;
+  }).then(function(r){
+    rearRunning=false;
+    // 走査で動かした再生位置を元に戻す（単一計測フローの邪魔をしない）
+    try{ v.currentTime=Math.max(0, Math.min(savedPos, v.duration||savedPos)); }catch(e){}
+    try{ els.seek.value=curFrame(); updateFrameUI(); }catch(e){}
+    updateRearModeUI();
+    return r;
+  });
+}
+// クラスCのときだけ有効な「この時刻で確定」ボタン: ユーザーが手動確認したことを記録し保存を許可する
+function confirmRearResult(){
+  if(!state.rearResult || state.rearResult.relClass!=='C') return;
+  state.rearResult.confirmed=true;
+  updateResult(); renderRearModeResult(); updateRearModeUI();
+  toast('この時刻で確定しました。保存できます');
+}
+// 後方球速モードの結果（クラスと内訳）をカード内へ表示
+function renderRearModeResult(){
+  if(!rearModeEls) return;
+  var rr=state.rearResult;
+  if(!rr){ rearModeEls.result.innerHTML=''; return; }
+  var r=computeResult();
+  var kmhTxt = (r.status==='ok')
+    ? ('推定初速 '+(r.kmhInit!=null?r.kmhInit:r.kmh).toFixed(1)+' km/h（区間平均 '+r.kmh.toFixed(1)+' km/h ・ '+r.frames+'F / '+r.timeSec.toFixed(3)+'s）')
+    : '球速はリリース/到達マークが揃ってから計算されます';
+  var clsTxt= rr.relClass==='A' ? 'A（分離を画像で確認・自動採用）'
+            : rr.relClass==='B' ? 'B（分離を外挿で推定）'
+            : 'C（姿勢候補のみ・手動確認が必要）'+(rr.confirmed?'・確定済み':'');
+  rearModeEls.result.innerHTML=
+    '<div class="rec-top"><span class="rec-name">信頼性クラス</span><span class="rec-kmh">'+clsTxt+'</span></div>'+
+    '<div class="rec-top"><span class="rec-name">リリース候補時刻（姿勢推定）</span><span class="rec-kmh">'+(rr.candidateT!=null?rr.candidateT.toFixed(3)+'s':'—')+'</span></div>'+
+    '<div class="rec-top"><span class="rec-name">分離フレーム</span><span class="rec-kmh">'+(rr.sepFound?'検出（F'+pad(frameNoOf(rr.releaseT),4)+'）':'なし')+'</span></div>'+
+    '<div class="rec-top"><span class="rec-name">リリース時刻（精密化後）</span><span class="rec-kmh">'+rr.releaseT.toFixed(3)+'s</span></div>'+
+    '<div class="rec-top"><span class="rec-name">到達候補</span><span class="rec-kmh">'+(rr.arrivalSource==='audio-onset'
+      ? '捕球音オンセット '+(rr.arrivalT!=null?rr.arrivalT.toFixed(3)+'s':'')+'（音速遅延補正済み）'
+      : '手動マークにフォールバック（音声から捕球音を検出できませんでした）')+'</span></div>'+
+    '<div class="rec-top"><span class="rec-name">球速</span><span class="rec-kmh">'+kmhTxt+'</span></div>';
+  updateRearModeUI();
 }
 
 /* ---- 初期化 ---- */
@@ -4954,8 +5467,10 @@ function runPoseAnalysis(){
   renderRecords();
   buildBatchUI(); // 一括解析カードを「1. 動画を読み込む」の直後へJSで挿入
   buildCalibUI(); // タップ校正カードを「2. コマ送り」カードの直後へJSで挿入
+  buildRearCalibUI(); // §13 v0.4: 後方校正カードをタップ校正カードの直後へJSで挿入（rear時のみ有効）
   buildTrajUI();  // 軌道抽出カードをタップ校正カードの直後へJSで挿入（Phase 3-B）
   buildPoseUI();  // フォーム解析（実験）カードを軌道抽出カードの直後へJSで挿入（Phase 2）
+  buildRearModeUI(); // §13 v0.4: 後方球速モード（Game Mode）カードをフォーム解析カードの直後へJSで挿入（rear時のみ有効）
   buildVoiceToggles(); // 音声読み上げトグルをクイック/詳細の設定へJSで挿入
   buildShootModeUI(); // 撮影モード切替＋後方撮影ガイドをクイック/詳細へJSで挿入（§13 v0.13）
   setView('quick'); // 初期画面はクイック計測。カメラを自動起動
@@ -4994,6 +5509,16 @@ if(typeof module!=='undefined' && module.exports){
     poseEls:function(){ return poseEls; }, poseRunning:function(){ return poseRunning; },
     setShootMode:setShootMode, isRear:isRear, buildShootModeUI:buildShootModeUI, updateShootModeUI:updateShootModeUI,
     shootSegs:function(){ return shootSegs; },
+    buildRearCalibUI:buildRearCalibUI, updateRearCalibUI:updateRearCalibUI,
+    startRearCalibration:startRearCalibration, cancelRearCalibration:cancelRearCalibration,
+    addRearCalibPoint:addRearCalibPoint, finishRearCalibration:finishRearCalibration, resetRearCalib:resetRearCalib,
+    rearCalibEls:function(){ return rearCalibEls; },
+    buildRearModeUI:buildRearModeUI, updateRearModeUI:updateRearModeUI,
+    runRearAuto:runRearAuto, rearRefineRelease:rearRefineRelease, renderRearModeResult:renderRearModeResult,
+    confirmRearResult:confirmRearResult, scanWristAt:scanWristAt, poseEstimateWindow:poseEstimateWindow,
+    rearRunning:function(){ return rearRunning; },
+    rearModeEls:function(){ return rearModeEls; },
+    rearResultNote:rearResultNote,
     buildRec:buildRec, autoSaveQuick:autoSaveQuick, q:q
   };
 }
