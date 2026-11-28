@@ -346,7 +346,7 @@ footer{margin-top:20px;}
     </div>
   </section>
 
-  <footer class="muted small center">キュウソク v0.18 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
+  <footer class="muted small center">キュウソク v0.20 — クイック計測は録画ボタン不要。計測・保存はすべてこの端末の中で完結します</footer>
 </div>
 <div id="toast" class="toast" hidden></div>
 
@@ -1715,6 +1715,103 @@ var KYU=(function(){
     return {plateKmh:v*r, decayPct:(1-r)*100, kD:kD};
   }
 
+  // E2後方外挿フィットの内部実装（work/validation/exp2.js・exp3.js の fitDrag と同一手順）:
+  // 2次抵抗モデルの閉形式 x(t)=ln(1+k*v*(t-t0))/k（k 固定）を未知数 (v,t0) で最小二乗フィットする。
+  // 初期値は y=exp(k*x)=1+k*v*(t-t0)=A*t+B の t に対する線形回帰（A=k*v, B=1-k*v*t0）で与え、
+  // 以降はガウス・ニュートン法（残差が下がる限りステップ長を半分にする簡易ラインサーチ、最大30反復）。
+  // ts/xs はフィット窓内の点のみを渡すこと。失敗時 null、成功時 {v, t0, rss}
+  function fitDragTrajectory(ts, xs, k){
+    var n=ts.length, i;
+    var sy=0, st=0, stt=0, sty=0;
+    var ys=new Array(n);
+    for(i=0;i<n;i++){
+      ys[i]=Math.exp(k*xs[i]);
+      sy+=ys[i]; st+=ts[i]; stt+=ts[i]*ts[i]; sty+=ys[i]*ts[i];
+    }
+    var den=n*stt-st*st;
+    if(!(Math.abs(den)>1e-15)) return null;
+    var A=(n*sty-st*sy)/den;   // = k*v
+    var B=(sy-A*st)/n;          // = 1 - k*v*t0
+    if(!(A>1e-9)) return null;
+    var v=A/k, t0=(1-B)/A;
+    if(!(v>0) || !isFinite(t0)) return null;
+    var rss=function(vv, tt){
+      var acc=0, j;
+      for(j=0;j<n;j++){
+        var w=1+k*vv*(ts[j]-tt);
+        if(w<=1e-9) return Infinity;
+        var r=Math.log(w)/k-xs[j];
+        acc+=r*r;
+      }
+      return acc;
+    };
+    var cur=rss(v, t0), it;
+    for(it=0; it<30; it++){
+      var a11=0, a12=0, a22=0, b1=0, b2=0;
+      for(i=0;i<n;i++){
+        var w=1+k*v*(ts[i]-t0);
+        if(w<=1e-9) return null;
+        var r=Math.log(w)/k-xs[i];
+        var jv=(ts[i]-t0)/w;   // dx/dv
+        var jt=-v/w;           // dx/dt0
+        a11+=jv*jv; a12+=jv*jt; a22+=jt*jt;
+        b1+=jv*r; b2+=jt*r;
+      }
+      var det=a11*a22-a12*a12;
+      if(!(Math.abs(det)>1e-20)) break;
+      var dv=(a22*b1-a12*b2)/det;
+      var dt=(a11*b2-a12*b1)/det;
+      var step=1, moved=false, h, nr;
+      for(h=0; h<10; h++){
+        nr=rss(v+step*dv, t0+step*dt);
+        if(nr<cur){ v+=step*dv; t0+=step*dt; cur=nr; moved=true; break; }
+        step*=0.5;
+      }
+      if(!moved) break;
+      if(Math.abs(step*dv)<1e-13 && Math.abs(step*dt)<1e-13) break;
+    }
+    if(!(v>0) || !isFinite(t0)) return null;
+    return {v:v, t0:t0, rss:cur};
+  }
+
+  // E2: 軌道後方外挿によるリリース推定（work/validation/exp2.js・exp3.js の E2 と同じ推定器。UIには未接続）
+  // points=[{t(秒), x(m)}] はボールの進行方向に沿った距離 x の観測列（時刻 t は任意原点でよい）。
+  // opts={k, windowLo, windowHi} で既定値を上書きできる:
+  //   k=K_DRAG（≈0.00727 /m。validation 側の K_APP に相当）で固定、windowLo=0.3, windowHi=3.0 [m]
+  // x が [windowLo, windowHi] に入る点だけを使い、x(t)=ln(1+k*v*(t-t0))/k を k 固定・(v,t0) 最小二乗でフィットする。
+  // 成功時 {t0(秒), v0ms(m/s), v0Kmh(km/h), nPoints, rmse(m)} を返す。
+  //   フィットで得た v がそのままリリース初速 v0 [m/s] であり、v0Kmh は m/s→km/h の単純換算（×3.6）のみで
+  //   よい（距離→初速の変換 initialSpeedFromAvg とは別役割。ここでは変換しない）
+  // usable 点が 3 未満の場合、およびフィット失敗時は null
+  function fitReleaseFromTrajectory(points, opts){
+    opts=opts||{};
+    var k=(typeof opts.k==='number' && isFinite(opts.k) && opts.k>0)?opts.k:K_DRAG;
+    var wLo=(typeof opts.windowLo==='number' && isFinite(opts.windowLo))?opts.windowLo:0.3;
+    var wHi=(typeof opts.windowHi==='number' && isFinite(opts.windowHi))?opts.windowHi:3.0;
+    if(!points || !Array.isArray(points)) return null;
+    if(!(wHi>wLo)) return null;
+    var ts=[], xs=[], i, p;
+    for(i=0;i<points.length;i++){
+      p=points[i];
+      if(!p) continue;
+      var t=Number(p.t), x=Number(p.x);
+      if(!isFinite(t) || !isFinite(x)) continue;
+      if(x>=wLo && x<=wHi){ ts.push(t); xs.push(x); }
+    }
+    var n=ts.length;
+    if(n<3) return null;
+    var fit=fitDragTrajectory(ts, xs, k);
+    if(!fit) return null;
+    var s2=0;
+    for(i=0;i<n;i++){
+      var w=1+k*fit.v*(ts[i]-fit.t0);
+      if(!(w>1e-9)) return null;
+      var r=Math.log(w)/k-xs[i];
+      s2+=r*r;
+    }
+    return {t0:fit.t0, v0ms:fit.v, v0Kmh:fit.v*3.6, nPoints:n, rmse:Math.sqrt(s2/n)};
+  }
+
   // 抗力+マグヌス揚力モデルのシューティングフィット（ivbFromFit 用）:
   // モデル dvx/dt=-k|v|vx - L|v|vy, dvy/dt=-k|v|vy - g + L|v|vx（L: 揚力係数 [1/m]、揚力は速度に垂直上向き）
   // を窓内サンプル (times, xs, ys) に直接フィットする。パラメータは windowStart における初期状態
@@ -3078,6 +3175,41 @@ var KYU=(function(){
     };
   }
 
+  /* ---- v0.19〜v0.20 モデル（抗力係数 k）の不確実性を含む初速範囲（純粋関数。2026-11-27 検証メモ / exp3 の V2 エンベロープを v0.20 で文献拡張） ---- */
+
+  // 任意の k を使う初速換算（initialSpeedFromAvg と同じ式 v0 = v_avg*(e^{kD}-1)/(kD) を k だけ差し替えたもの）。
+  // avgKmh<=0・distM<=0・k<=0・非有限値なら null
+  function initialSpeedFromAvgK(avgKmh, distM, k){
+    var v=Number(avgKmh), d=Number(distM), kk=Number(k);
+    if(!isFinite(v) || !isFinite(d) || !isFinite(kk) || v<=0 || d<=0 || kk<=0) return null;
+    var kD=kk*d;
+    return v*(Math.exp(kD)-1)/kD;
+  }
+  // モデルエンベロープの k グリッド [/m]: [0.0050, K_DRAG(≈0.00727), 0.0090]（v0.20: 2026-11-28 厳格討論で採用された文献拡張レンジ k∈[0.0050,0.0090]。中央は既存ヒーロー値と一致させるため K_DRAG）
+  var K_MODEL_GRID=[0.0050, K_DRAG, 0.0090];
+  // 時刻の不確実性＋抗力モデルの不確実性を含む初速範囲:
+  //   point = 既存の k=K_DRAG(≈0.00727) 変換（speedRangeFromUncertainty(f,0,d) の lo=hi、現ヒーロー値と一致）
+  //   lo/hi = 飛行時間端点 {flightSec+uSec, max(0.05, flightSec-uSec)}（speedRangeFromUncertainty と同じ約束）
+  //           × k グリッド {0.0050, K_DRAG, 0.0090} の全 6 点の min/max（各点は initialSpeedFromAvgK の同じ変換式）
+  //   uSec=0 でも k の広がりだけで lo < point < hi になる（distM<=0 等の無効入力は {point:null, lo:null, hi:null}）
+  function speedRangeWithModel(flightSec, uSec, distM){
+    var f=Number(flightSec), u=Number(uSec), d=Number(distM);
+    if(!isFinite(f) || !isFinite(u) || !isFinite(d) || f<=0 || d<=0 || u<0) return {point:null, lo:null, hi:null};
+    var point=initialSpeedFromAvg(speedKmhByTime(d, f), d);
+    var tEnds=[f+u, Math.max(0.05, f-u)];
+    var lo=null, hi=null;
+    for(var ti=0; ti<tEnds.length; ti++){
+      var avg=speedKmhByTime(d, tEnds[ti]);
+      for(var ki=0; ki<K_MODEL_GRID.length; ki++){
+        var v=initialSpeedFromAvgK(avg, d, K_MODEL_GRID[ki]);
+        if(v==null) continue;
+        if(lo==null || v<lo) lo=v;
+        if(hi==null || v>hi) hi=v;
+      }
+    }
+    return {point:point, lo:lo, hi:hi};
+  }
+
   // リリース時刻ブラケット幅(ms)からのリリースクラス: ≤8.33ms=A（240fpsの2フレーム相当）、
   //   ≤25ms=B（120fpsの3フレーム相当）、それ以上=C
   function releaseClassFromBracket(bracketMs){
@@ -3128,6 +3260,7 @@ var KYU=(function(){
     clientToVideoPx:clientToVideoPx, videoPxToPercent:videoPxToPercent, speechTextForKmh:speechTextForKmh,
     fitFlightPath:fitFlightPath, flightQualityGate:flightQualityGate,
     ivbFromFit:ivbFromFit, plateSpeedFromInitial:plateSpeedFromInitial, K_DRAG:K_DRAG,
+    fitReleaseFromTrajectory:fitReleaseFromTrajectory,
     TRAJ_DIFF_THR:TRAJ_DIFF_THR, TRAJ_MIN_PX:TRAJ_MIN_PX, TRAJ_SEARCH_R:TRAJ_SEARCH_R,
     TRAJ_BAND_HALF:TRAJ_BAND_HALF, TRAJ_MOTION_MIN:TRAJ_MOTION_MIN,
     FINE_MAX_W:FINE_MAX_W, FINE_HALF:FINE_HALF, FINE_DIFF_THR:FINE_DIFF_THR,
@@ -3143,6 +3276,7 @@ var KYU=(function(){
     classifyRelease:classifyRelease, firstAudioOnsetAfter:firstAudioOnsetAfter,
     speedRangeFromUncertainty:speedRangeFromUncertainty, releaseClassFromBracket:releaseClassFromBracket,
     combineReliabilityClass:combineReliabilityClass, timeUncertaintyMs:timeUncertaintyMs,
+    speedRangeWithModel:speedRangeWithModel, initialSpeedFromAvgK:initialSpeedFromAvgK, K_MODEL_GRID:K_MODEL_GRID,
     MITT_BEHIND_M_DEFAULT:MITT_BEHIND_M_DEFAULT, ZONE_LOW_CM:ZONE_LOW_CM, ZONE_HIGH_CM:ZONE_HIGH_CM,
     PLATE_ROI_W_MULT:PLATE_ROI_W_MULT, PLATE_ROI_H_M:PLATE_ROI_H_M, PLATE_ROI_DOWN_M:PLATE_ROI_DOWN_M, PLATE_MIN_PX:PLATE_MIN_PX,
     platePassTime:platePassTime, platePositionFromPx:platePositionFromPx, centroidInRoi:centroidInRoi,
@@ -3704,7 +3838,7 @@ function resultPanelHTML(r, excludeId){
   // v0.18: 動画の実効fpsが 120 未満ならヒーロー球速は整数（四捨五入）、120以上なら従来どおり1桁小数
   var lowFps=effectiveFps()<120;
   var heroTxt=lowFps ? String(Math.round(heroKmh)) : heroKmh.toFixed(1);
-  // v0.18: 時刻の不確実性による推定範囲（rear詳細結果の speedLo/speedHi。r に無ければ state.rearResult から取る）
+  // v0.18/v0.19: 時刻＋モデルの不確実性による推定範囲（rear詳細結果の speedLo/speedHi。r に無ければ state.rearResult から取る）
   //   幅が 1 km/h 以上のときだけヒーローの下に小さく表示。lo=切り捨て・hi=切り上げ（外向き丸め）で表示する
   var rr18=(isRear() && state.rearResult) ? state.rearResult : null;
   var sLo=(typeof r.speedLo==='number' && isFinite(r.speedLo)) ? r.speedLo
@@ -3715,7 +3849,7 @@ function resultPanelHTML(r, excludeId){
   if(sLo!=null && sHi!=null && (sHi-sLo)>=1){
     var loTxt=lowFps ? String(Math.floor(sLo)) : (Math.floor(sLo*10+1e-9)/10).toFixed(1);
     var hiTxt=lowFps ? String(Math.ceil(sHi)) : (Math.ceil(sHi*10-1e-9)/10).toFixed(1);
-    rangeHtml='<div class="hero-range small">推定範囲（時刻の不確実性）: '+loTxt+'–'+hiTxt+' km/h</div>';
+    rangeHtml='<div class="hero-range small">推定範囲（時刻・モデルの不確実性）: '+loTxt+'–'+hiTxt+' km/h</div>';
   }
   return '<div class="rpanel">'+
     '<div class="hero-tile"><div class="t-label">推定初速</div><div class="hero-val">'+heroTxt+'</div><div class="hero-unit">km/h</div>'+rangeHtml+'</div>'+
@@ -4761,7 +4895,7 @@ function makeRecord(r, o){
       : (state.rearResult && state.rearResult.relClass!=null ? state.rearResult.relClass : null);
     if(relClass!=null) rec.relClass=relClass;
     // v0.18: 詳細ビュー（source='detail'）のときだけ、検出クラスを detectionClass として保持し、
-    //   ブラケット幅・時刻不確実性・推定範囲・距離ソース・リリースクラス・統合後の信頼性クラスも記録へ格納する
+    //   ブラケット幅・時刻不確実性・推定範囲（v0.19: 時刻＋kエンベロープ）・rangeModel・距離ソース・リリースクラス・統合後の信頼性クラスも記録へ格納する
     //   （一括解析のバッチ行が既に持つ relClass 等の形は変えない＝新フィールドは詳細ビューのみ）
     if((o.source==='detail' || !o.source) && state.rearResult && relClass!=null){
       var rr18=state.rearResult;
@@ -4769,7 +4903,7 @@ function makeRecord(r, o){
       var f18=(rr18.reliabilityClass!=null) ? rr18
         : applyRearReliability({relClass:relClass, arrivalSource:rr18.arrivalSource, arrivalKind:rr18.arrivalKind,
                                 releaseT:rr18.releaseT, arrivalT:rr18.arrivalT}, {});
-      ['bracketMs','uncertaintyMs','speedLo','speedHi','distanceSource','releaseClass','reliabilityClass'].forEach(function(k){
+      ['bracketMs','uncertaintyMs','speedLo','speedHi','rangeModel','distanceSource','releaseClass','reliabilityClass'].forEach(function(k){
         if(f18[k]!=null) rec[k]=f18[k];
       });
     }
@@ -5332,7 +5466,8 @@ function rearPlateSettings(){
    リリースのブラケット幅 bracketMs は検出パスで決まる: 分離が画像で確認できた(A)=1フレーム間隔、
    外挿で推定(B)=2フレーム間隔、姿勢候補のみ(C)=80ms固定。arrivalKind は到達が捕球音オンセット由来なら
    'audio'、ユーザーが手動で確定・調整したら 'manual'。uncertaintyMs は KYU.timeUncertaintyMs、
-   speedLo/speedHi は KYU.speedRangeFromUncertainty（飛行時間=到達−リリース、有効距離=effectiveDistance）で
+   speedLo/speedHi は KYU.speedRangeWithModel（v0.20: 飛行時間=到達−リリース、有効距離=effectiveDistance に対し
+   時刻不確実性＋抗力モデル k エンベロープ [0.0050, 0.00727, 0.0090] の範囲。rangeModel='time+k-envelope-050-090' を付与）で
    初速範囲を算出する。releaseClass は KYU.releaseClassFromBracket、表示用の最終クラス reliabilityClass は
    KYU.combineReliabilityClass(releaseClass, 検出クラス relClass, distanceSource) で決まる
    （距離が 'assumed' なら A にはならず B にキャップ）。これらを state.rearResult と記録へ格納する。 */
@@ -5364,14 +5499,15 @@ function applyRearReliability(rr, o){
   var reliabilityClass=KYU.combineReliabilityClass(releaseClass, rr.relClass, distanceSource);
   var releaseT=(rr.releaseT!=null) ? rr.releaseT : state.releaseTime;
   var arrivalT=(o.arrivalT!=null) ? o.arrivalT : ((rr.arrivalT!=null) ? rr.arrivalT : state.arrivalTime);
-  var speedLo=null, speedHi=null;
+  var speedLo=null, speedHi=null, rangeModel=null;
   var eff=effectiveDistance();
   if(releaseT!=null && arrivalT!=null && (arrivalT-releaseT)>0 && eff!=null && eff>0){
-    var rg=KYU.speedRangeFromUncertainty(arrivalT-releaseT, uncertaintyMs/1000, eff);
-    speedLo=rg.lo; speedHi=rg.hi;
+    // v0.20: 時刻の不確実性だけでなく抗力モデル（k）の不確実性も含む範囲（文献拡張エンベロープ k∈[0.0050,0.0090]）
+    var rg=KYU.speedRangeWithModel(arrivalT-releaseT, uncertaintyMs/1000, eff);
+    speedLo=rg.lo; speedHi=rg.hi; rangeModel='time+k-envelope-050-090';
   }
   rr.bracketMs=bracketMs; rr.arrivalKind=arrivalKind; rr.uncertaintyMs=uncertaintyMs;
-  rr.speedLo=speedLo; rr.speedHi=speedHi; rr.distanceSource=distanceSource;
+  rr.speedLo=speedLo; rr.speedHi=speedHi; rr.rangeModel=rangeModel; rr.distanceSource=distanceSource;
   rr.releaseClass=releaseClass; rr.reliabilityClass=reliabilityClass;
   return rr;
 }
@@ -6379,7 +6515,7 @@ function runRearAuto(o){
       sepFound:ref.sepFound, sepIndex:ref.sepIndex,
       arrivalT:arr, arrivalSource:ref.arrivalSource, confirmed:false
     };
-    // v0.18: 信頼性フィールド（bracketMs/arrivalKind/uncertaintyMs/speedLo/speedHi/distanceSource/releaseClass/reliabilityClass）を算出して付与
+    // v0.18/v0.19: 信頼性フィールド（bracketMs/arrivalKind/uncertaintyMs/speedLo/speedHi/rangeModel/distanceSource/releaseClass/reliabilityClass）を算出して付与
     applyRearReliability(state.rearResult, {arrivalT:(arr!=null?arr:state.arrivalTime)});
     // v0.15: プレート通過位置を計測（rear専用。校正済みの場合のみ有効・未校正/検出失敗時は位置なしで球速のみ）
     return Promise.all([
@@ -6477,7 +6613,7 @@ function renderRearModeResult(){
     ? '<div class="rec-top"><span class="rec-name">時刻の不確実性</span><span class="rec-kmh">±'+rr.uncertaintyMs.toFixed(1)+'ms（リリースブラケット '+rr.bracketMs.toFixed(1)+'ms ・ 到達 '+(rr.arrivalKind==='audio'?'捕球音':'手動')+' ・ 距離:'+(rr.distanceSource==='measured'?'実測':'仮定')+'）</span></div>'
     : '';
   var rangeRow=(typeof rr.speedLo==='number' && isFinite(rr.speedLo) && typeof rr.speedHi==='number' && isFinite(rr.speedHi))
-    ? '<div class="rec-top"><span class="rec-name">推定範囲（時刻の不確実性）</span><span class="rec-kmh">'+rr.speedLo.toFixed(1)+'–'+rr.speedHi.toFixed(1)+' km/h</span></div>'
+    ? '<div class="rec-top"><span class="rec-name">推定範囲（時刻・モデルの不確実性）</span><span class="rec-kmh">'+rr.speedLo.toFixed(1)+'–'+rr.speedHi.toFixed(1)+' km/h</span></div>'
     : '';
   rearModeEls.result.innerHTML=
     '<div class="rec-top"><span class="rec-name">信頼性クラス</span><span class="rec-kmh">'+clsTxt+'</span></div>'+
